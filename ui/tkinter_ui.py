@@ -1018,8 +1018,9 @@ class QueryToolUI:
             # 添加自定义日志处理器
             ui_handler = UITextHandler(log_text, dialog)
             # 只捕获部署和SSH相关的日志
-            deploy_logger = logging.getLogger('query_tool.core.deploy')
-            ssh_logger = logging.getLogger('query_tool.core.ssh_client')
+            # 注意：日志记录器名称应该与模块中的 __name__ 匹配
+            deploy_logger = logging.getLogger('core.deploy')
+            ssh_logger = logging.getLogger('core.ssh_client')
             
             # 保存原始级别（如果logger没有显式设置级别，level会是NOTSET）
             deploy_level = deploy_logger.level if deploy_logger.level != logging.NOTSET else None

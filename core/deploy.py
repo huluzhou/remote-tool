@@ -48,8 +48,8 @@ class Deployer:
         if project_root is None:
             # 从当前文件位置向上查找项目根目录
             current_file = Path(__file__).resolve()
-            # query_tool/core/deploy.py -> query_tool -> 项目根目录
-            project_root = current_file.parent.parent.parent
+            # core/deploy.py -> core -> 项目根目录
+            project_root = current_file.parent.parent
             # 如果项目根目录不存在，尝试从当前工作目录查找
             if not Path(project_root).exists():
                 # 尝试查找包含Cargo.toml的目录

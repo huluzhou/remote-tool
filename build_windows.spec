@@ -8,7 +8,6 @@ from pathlib import Path
 
 # 项目根目录
 project_root = Path(SPECPATH).parent
-query_tool_dir = project_root / "query_tool"
 
 block_cipher = None
 
