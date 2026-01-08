@@ -100,26 +100,26 @@ class Deployer:
         exit_status, stdout, stderr = self.ssh.execute_command(
             f"test -f {self.INSTALL_DIR}/bin/{self.BINARY_NAME} && echo 'exists' || echo 'not_exists'"
         )
-        status["installed"] = "exists" in stdout
+        status["installed"] = stdout.strip() == "exists"
         
         # 检查服务文件是否存在
         exit_status, stdout, stderr = self.ssh.execute_command(
             f"test -f {self.SERVICE_FILE} && echo 'exists' || echo 'not_exists'"
         )
-        status["service_exists"] = "exists" in stdout
+        status["service_exists"] = stdout.strip() == "exists"
         
         # 检查服务是否运行
         if status["service_exists"]:
             exit_status, stdout, stderr = self.ssh.execute_command(
                 f"systemctl is-active {self.SERVICE_NAME} 2>/dev/null && echo 'active' || echo 'inactive'"
             )
-            status["service_running"] = "active" in stdout
+            status["service_running"] = stdout.strip() == "active"
             
             # 检查服务是否启用
             exit_status, stdout, stderr = self.ssh.execute_command(
                 f"systemctl is-enabled {self.SERVICE_NAME} 2>/dev/null && echo 'enabled' || echo 'disabled'"
             )
-            status["service_enabled"] = "enabled" in stdout
+            status["service_enabled"] = stdout.strip() == "enabled"
         
         return status
     
