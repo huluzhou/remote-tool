@@ -522,6 +522,7 @@ class QueryToolUI:
             # 指令查询：隐藏扩展表选项，设备序列号为必填
             self.include_ext_check.grid_remove()
             self.device_sn_label.config(text="设备序列号: *")
+            self.device_sn_entry.config(state=tk.NORMAL)
         elif query_type == "wide_table":
             # 宽表查询：显示扩展表选项，设备序列号为可选（不显示）
             self.include_ext_check.grid()
