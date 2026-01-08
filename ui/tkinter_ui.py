@@ -367,7 +367,7 @@ class QueryToolUI:
         export_frame.grid(row=4, column=0, columnspan=2, pady=5)
         ttk.Button(export_frame, text="导出为CSV", command=self.export_csv, state=tk.DISABLED).grid(row=0, column=0, padx=5)
         ttk.Button(export_frame, text="保存配置", command=self.save_config).grid(row=0, column=1, padx=5)
-        self.deploy_btn = ttk.Button(export_frame, text="部署/更新", command=self.show_deploy_dialog, state=tk.DISABLED)
+        self.deploy_btn = ttk.Button(export_frame, text="部署", command=self.show_deploy_dialog, state=tk.DISABLED)
         self.deploy_btn.grid(row=0, column=2, padx=5)
         
         # 存储查询结果和查询类型
@@ -846,8 +846,8 @@ class QueryToolUI:
         
         # 创建部署对话框
         dialog = tk.Toplevel(self.root)
-        dialog.title("部署/更新程序")
-        dialog.geometry("600x750")  # 增加窗口高度，确保按钮可见
+        dialog.title("部署程序")
+        dialog.geometry("600x800")  # 增加窗口高度，确保按钮可见
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -1115,14 +1115,6 @@ class QueryToolUI:
                             self.upload_topo_var.set(False)
                 
                 deployer = Deployer(self.ssh_client, project_root)
-                
-                # 检查远程状态
-                log("检查远程服务器状态...")
-                status = deployer.check_remote_status()
-                if status["installed"]:
-                    log("检测到已部署的程序，将执行更新操作")
-                else:
-                    log("未检测到已部署的程序，将执行新部署操作")
                 
                 # 执行部署
                 success, message, log_messages = deployer.deploy(
