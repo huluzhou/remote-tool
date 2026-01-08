@@ -72,15 +72,15 @@ jobs:
       run: |
         python -m PyInstaller build_windows.spec --clean --noconfirm
     
-    - name: Build CLI executable
-      shell: pwsh
-      run: |
-        if (Test-Path build_windows_cli.spec) {
-          python -m PyInstaller build_windows_cli.spec --clean --noconfirm
-        } else {
-          Write-Host "CLI spec file not found, skipping CLI build"
-        }
-      continue-on-error: true
+    # - name: Build CLI executable
+    #   shell: pwsh
+    #   run: |
+    #     if (Test-Path build_windows_cli.spec) {
+    #       python -m PyInstaller build_windows_cli.spec --clean --noconfirm
+    #     } else {
+    #       Write-Host "CLI spec file not found, skipping CLI build"
+    #     }
+    #   continue-on-error: true
     
     - name: Verify build artifacts
       shell: pwsh
@@ -99,31 +99,29 @@ jobs:
           Write-Host "  - $($_.Name): $([math]::Round($_.Length / 1MB, 2)) MB"
         }
     
-    - name: Create release package
+    - name: Create executable package
       shell: pwsh
       run: |
-        $releaseDir = "dist\release"
-        New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        
-        # Copy executables
-        Copy-Item dist\query_tool.exe $releaseDir\ -Force
-        if (Test-Path dist\query_tool_cli.exe) {
-          Copy-Item dist\query_tool_cli.exe $releaseDir\ -Force
-        }
-        
-        # Copy configuration files
-        if (Test-Path csv_export_config.toml) {
-          Copy-Item csv_export_config.toml $releaseDir\ -Force
-        }
-        if (Test-Path version.txt) {
-          Copy-Item version.txt $releaseDir\ -Force
-        }
-        
-        # Create README
         $version = "${{ steps.version.outputs.VERSION }}"
         $buildDate = "${{ steps.version.outputs.BUILD_DATE }}"
         $gitCommit = "${{ steps.version.outputs.GIT_COMMIT }}"
         
+        # 创建可执行文件包目录
+        $executableDir = "dist\executable"
+        New-Item -ItemType Directory -Force -Path $executableDir | Out-Null
+        
+        # 复制可执行文件
+        Copy-Item dist\query_tool.exe $executableDir\ -Force
+        
+        # 复制配置文件
+        if (Test-Path csv_export_config.toml) {
+          Copy-Item csv_export_config.toml $executableDir\ -Force
+        }
+        if (Test-Path version.txt) {
+          Copy-Item version.txt $executableDir\ -Force
+        }
+        
+        # 创建 README
         $readme = @"
         Query Tool Release Package
         Version: $version
@@ -132,37 +130,90 @@ jobs:
         
         Files:
         - query_tool.exe: GUI version
-        - query_tool_cli.exe: CLI version (if available)
         - csv_export_config.toml: Configuration file
         - version.txt: Version information
         
         Usage:
         1. Extract all files to the same directory
         2. Double-click query_tool.exe to run GUI version
-        3. Or run query_tool_cli.exe --help in command line
         
         Note:
         - First run may take a few seconds to start
         - Some antivirus software may report false positives, add to whitelist if needed
         - For detailed usage instructions, see USER_GUIDE.md
         "@
-        $readme | Out-File -FilePath "$releaseDir\README.txt" -Encoding utf8
+        $readme | Out-File -FilePath "$executableDir\README.txt" -Encoding utf8
         
-        Write-Host "✓ Release package created in $releaseDir"
+        Write-Host "✓ Executable package created in $executableDir"
     
-    - name: Create ZIP archive
+    - name: Create executable archive
       shell: pwsh
       run: |
         $version = "${{ steps.version.outputs.VERSION }}"
-        $zipName = "query-tool-windows-$version.zip"
-        $releaseDir = "dist\release"
+        $executableZipName = "query-tool-windows-$version.zip"
+        $executableDir = "dist\executable"
         
-        # Create ZIP file
-        Compress-Archive -Path "$releaseDir\*" -DestinationPath "dist\$zipName" -Force
+        # 查找 7z 可执行文件路径
+        # GitHub Actions Windows runner 通常已预装 7-Zip
+        $7zPaths = @(
+          "C:\Program Files\7-Zip\7z.exe",
+          "${env:ProgramFiles}\7-Zip\7z.exe",
+          "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+        )
         
-        Write-Host "✓ ZIP archive created: $zipName"
-        Get-Item "dist\$zipName" | ForEach-Object {
+        $7zPath = $null
+        foreach ($path in $7zPaths) {
+          if (Test-Path $path) {
+            $7zPath = $path
+            break
+          }
+        }
+        
+        # 尝试通过 PATH 查找
+        if (-not $7zPath) {
+          $7zCmd = Get-Command 7z -ErrorAction SilentlyContinue
+          if ($7zCmd) {
+            $7zPath = $7zCmd.Source
+          }
+        }
+        
+        if (-not $7zPath) {
+          Write-Error "7-Zip not found. GitHub Actions Windows runner should have 7-Zip pre-installed."
+          exit 1
+        }
+        
+        Write-Host "Using 7-Zip at: $7zPath"
+        
+        # 使用 7z 创建压缩包（使用 zip 格式以保持兼容性，最大压缩级别）
+        # -mx=9: 最大压缩级别
+        # -mm=Deflate: 使用 Deflate 压缩方法（zip 标准）
+        # -mmt=on: 启用多线程压缩
+        # -mfb=258: 快速字节数（提高压缩率）
+        & $7zPath a -tzip -mx=9 -mm=Deflate -mmt=on -mfb=258 "dist\$executableZipName" "$executableDir\*"
+        
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Failed to create archive with 7z (exit code: $LASTEXITCODE)"
+          exit 1
+        }
+        
+        Write-Host "✓ Executable archive created: $executableZipName"
+        Get-Item "dist\$executableZipName" | ForEach-Object {
           Write-Host "  - Size: $([math]::Round($_.Length / 1MB, 2)) MB"
+        }
+    
+    - name: Create release directory
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.VERSION }}"
+        $releaseDir = "dist\release"
+        New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+        
+        # 复制可执行文件压缩包到 release 目录
+        Copy-Item "dist\query-tool-windows-$version.zip" $releaseDir\ -Force
+        
+        Write-Host "✓ Release directory created with archive"
+        Get-ChildItem $releaseDir | ForEach-Object {
+          Write-Host "  - $($_.Name): $([math]::Round($_.Length / 1MB, 2)) MB"
         }
     
     - name: Upload build artifacts
@@ -170,7 +221,6 @@ jobs:
       with:
         name: query-tool-${{ steps.version.outputs.VERSION }}
         path: |
-          dist/query-tool-windows-*.zip
           dist/release/*
         retention-days: 30
     
@@ -178,7 +228,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v1
       with:
-        files: dist/query-tool-windows-*.zip
+        files: dist/release/query-tool-windows-*.zip
         name: Release ${{ github.ref_name }}
         body: |
           ## Query Tool ${{ github.ref_name }}
@@ -189,16 +239,15 @@ jobs:
           - Git Branch: ${{ steps.version.outputs.GIT_BRANCH }}
           
           **Installation:**
-          1. Download the ZIP file
-          2. Extract to any directory
-          3. Run `query_tool.exe`
+          1. 下载 `query-tool-windows-*.zip` 文件
+          2. 解压到任意目录
+          3. 双击运行 `query_tool.exe`
           
-          **Files included:**
-          - `query_tool.exe` - GUI version
-          - `query_tool_cli.exe` - CLI version (if available)
-          - `csv_export_config.toml` - Configuration file
-          - `version.txt` - Version information
-          - `README.txt` - Usage instructions
+          **文件包包含:**
+          - `query_tool.exe` - GUI 版本
+          - `csv_export_config.toml` - 配置文件
+          - `version.txt` - 版本信息
+          - `README.txt` - 使用说明
           
           For detailed usage instructions, see [USER_GUIDE.md](USER_GUIDE.md).
         draft: false
