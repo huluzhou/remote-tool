@@ -48,11 +48,8 @@ class CSVExporter:
             if getattr(sys, 'frozen', False):
                 # 打包后的可执行文件，配置文件在可执行文件同目录
                 base_path = Path(sys.executable).parent
-                # 优先在可执行文件同目录查找配置文件
+                # 配置文件在可执行文件同目录
                 config_path = base_path / "csv_export_config.toml"
-                # 如果不在同目录，尝试在 query_tool 子目录
-                if not config_path.exists():
-                    config_path = base_path / "query_tool" / "csv_export_config.toml"
             else:
                 # 开发环境，配置文件在模块目录
                 config_path = Path(__file__).parent.parent / "csv_export_config.toml"

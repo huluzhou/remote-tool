@@ -38,7 +38,7 @@ class QueryToolUI:
     
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.geometry("800x700")
+        self.root.geometry("1000x900")
         
         # 设置中文字体
         self.setup_fonts()
@@ -589,12 +589,54 @@ class QueryToolUI:
             
             # 初始化UI状态
             self.result_text.delete(1.0, tk.END)
-            self.result_text.insert(tk.END, "正在查询，请稍候...\n")
+            self.result_text.insert(tk.END, "正在查询，请稍候...\n\n")
             self.query_btn.config(state=tk.DISABLED)
             # 重置进度条为0
             self.progress_bar['value'] = 0
             self.progress_var.set("正在连接数据库...")
             self.root.update()
+            
+            # 创建查询日志处理器，将日志输出到查询结果控件
+            class QueryLogHandler(logging.Handler):
+                def __init__(self, text_widget, root_window):
+                    super().__init__()
+                    self.text_widget = text_widget
+                    self.root_window = root_window
+                    self.setLevel(logging.INFO)
+                    # 设置详细格式，包含时间戳、模块名、日志级别和消息
+                    formatter = logging.Formatter(
+                        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S'
+                    )
+                    self.setFormatter(formatter)
+                
+                def emit(self, record):
+                    try:
+                        msg = self.format(record)
+                        # 在UI线程中更新日志
+                        def update_ui(message=msg):
+                            self.text_widget.insert(tk.END, f"{message}\n")
+                            self.text_widget.see(tk.END)
+                        self.root_window.after(0, update_ui)
+                    except Exception:
+                        pass  # 忽略日志处理错误
+            
+            # 添加日志处理器
+            query_log_handler = QueryLogHandler(self.result_text, self.root)
+            db_query_logger = logging.getLogger('core.db_query')
+            ssh_logger = logging.getLogger('core.ssh_client')
+            
+            # 保存原始级别
+            db_query_level = db_query_logger.level if db_query_logger.level != logging.NOTSET else None
+            ssh_level = ssh_logger.level if ssh_logger.level != logging.NOTSET else None
+            
+            # 确保日志级别足够低以捕获INFO日志
+            db_query_logger.setLevel(logging.INFO)
+            ssh_logger.setLevel(logging.INFO)
+            
+            # 添加处理器
+            db_query_logger.addHandler(query_log_handler)
+            ssh_logger.addHandler(query_log_handler)
             
             # 定义进度回调函数（主要用于宽表查询）
             def progress_callback(stage: str, progress: float = None):
@@ -658,9 +700,23 @@ class QueryToolUI:
                         )
                     
                     # 查询完成，更新UI（保存查询类型）
-                    self.root.after(0, lambda q=query_type, r=results: self._on_query_completed(r, q))
+                    self.root.after(0, lambda q=query_type, r=results, h=query_log_handler, dq=db_query_logger, s=ssh_logger, dql=db_query_level, sl=ssh_level: self._on_query_completed(r, q, h, dq, s, dql, sl))
                 except Exception as e:
                     logger.error(f"Query error: {e}", exc_info=True)
+                    # 移除日志处理器
+                    try:
+                        db_query_logger.removeHandler(query_log_handler)
+                        ssh_logger.removeHandler(query_log_handler)
+                        if db_query_level is not None:
+                            db_query_logger.setLevel(db_query_level)
+                        else:
+                            db_query_logger.setLevel(logging.NOTSET)
+                        if ssh_level is not None:
+                            ssh_logger.setLevel(ssh_level)
+                        else:
+                            ssh_logger.setLevel(logging.NOTSET)
+                    except Exception:
+                        pass
                     self.root.after(0, lambda: self._on_query_error(str(e)))
             
             # 启动查询线程
@@ -677,8 +733,24 @@ class QueryToolUI:
             self.result_text.insert(tk.END, f"查询失败: {e}\n")
             messagebox.showerror("错误", f"查询失败: {e}")
     
-    def _on_query_completed(self, results, query_type=None):
+    def _on_query_completed(self, results, query_type=None, log_handler=None, db_query_logger=None, ssh_logger=None, db_query_level=None, ssh_level=None):
         """查询完成回调"""
+        # 移除日志处理器
+        if log_handler and db_query_logger and ssh_logger:
+            try:
+                db_query_logger.removeHandler(log_handler)
+                ssh_logger.removeHandler(log_handler)
+                if db_query_level is not None:
+                    db_query_logger.setLevel(db_query_level)
+                else:
+                    db_query_logger.setLevel(logging.NOTSET)
+                if ssh_level is not None:
+                    ssh_logger.setLevel(ssh_level)
+                else:
+                    ssh_logger.setLevel(logging.NOTSET)
+            except Exception:
+                pass
+        
         # 显示100%完成
         self.progress_bar['value'] = 100
         self.progress_var.set("查询完成 (100%)")
@@ -688,7 +760,11 @@ class QueryToolUI:
         # 保存查询结果和查询类型
         self.query_results = results
         self.query_type = query_type if query_type else self.query_type_var.get()
-        self.result_text.delete(1.0, tk.END)
+        
+        # 不删除日志，在日志后添加查询结果预览
+        self.result_text.insert(tk.END, "\n" + "=" * 80 + "\n")
+        self.result_text.insert(tk.END, "查询结果预览:\n")
+        self.result_text.insert(tk.END, "=" * 80 + "\n\n")
         
         if results:
             # 显示前几行作为预览
@@ -1018,8 +1094,9 @@ class QueryToolUI:
             # 添加自定义日志处理器
             ui_handler = UITextHandler(log_text, dialog)
             # 只捕获部署和SSH相关的日志
-            deploy_logger = logging.getLogger('query_tool.core.deploy')
-            ssh_logger = logging.getLogger('query_tool.core.ssh_client')
+            # 注意：日志记录器名称应该与模块中的 __name__ 匹配
+            deploy_logger = logging.getLogger('core.deploy')
+            ssh_logger = logging.getLogger('core.ssh_client')
             
             # 保存原始级别（如果logger没有显式设置级别，level会是NOTSET）
             deploy_level = deploy_logger.level if deploy_logger.level != logging.NOTSET else None
