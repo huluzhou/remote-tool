@@ -25,10 +25,10 @@ import base64
 import threading
 from typing import Optional, Callable
 
-from ..core.ssh_client import SSHClient
-from ..core.db_query import DBQuery
-from ..core.csv_export import CSVExporter
-from ..core.deploy import Deployer
+from core.ssh_client import SSHClient
+from core.db_query import DBQuery
+from core.csv_export import CSVExporter
+from core.deploy import Deployer
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +289,7 @@ class QueryToolUI:
         
         # 查询类型选择
         ttk.Label(query_frame, text="查询类型:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.query_type_var = tk.StringVar(value="device")
+        self.query_type_var = tk.StringVar(value="wide_table")
         query_type_frame = ttk.Frame(query_frame)
         query_type_frame.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
         ttk.Radiobutton(query_type_frame, text="设备数据", variable=self.query_type_var, 

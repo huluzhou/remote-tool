@@ -14,7 +14,7 @@ if getattr(sys, 'frozen', False):
     project_root = base_path
 else:
     # 开发环境
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent
     sys.path.insert(0, str(project_root))
 
 # 检查 tkinter 是否可用
@@ -38,7 +38,7 @@ except ImportError:
 
 import logging
 
-from query_tool.ui.tkinter_ui import main
+from ui.tkinter_ui import main
 
 if __name__ == "__main__":
     # 配置日志输出到控制台

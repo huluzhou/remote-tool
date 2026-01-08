@@ -30,9 +30,6 @@ jobs:
     - name: Upgrade pip
       run: python -m pip install --upgrade pip
     
-    - name: Configure pip mirror (Tsinghua)
-      run: pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-    
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
@@ -58,6 +55,7 @@ jobs:
         
         "BUILD_DATE=$buildDate" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         "GIT_COMMIT=$gitCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "GIT_BRANCH=$gitBranch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         "VERSION=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         
         Write-Host "Version: $version"
@@ -127,27 +125,27 @@ jobs:
         $gitCommit = "${{ steps.version.outputs.GIT_COMMIT }}"
         
         $readme = @"
-Query Tool Release Package
-Version: $version
-Build Date: $buildDate
-Git Commit: $gitCommit
-
-Files:
-- query_tool.exe: GUI version
-- query_tool_cli.exe: CLI version (if available)
-- csv_export_config.toml: Configuration file
-- version.txt: Version information
-
-Usage:
-1. Extract all files to the same directory
-2. Double-click query_tool.exe to run GUI version
-3. Or run query_tool_cli.exe --help in command line
-
-Note:
-- First run may take a few seconds to start
-- Some antivirus software may report false positives, add to whitelist if needed
-- For detailed usage instructions, see USER_GUIDE.md
-"@
+        Query Tool Release Package
+        Version: $version
+        Build Date: $buildDate
+        Git Commit: $gitCommit
+        
+        Files:
+        - query_tool.exe: GUI version
+        - query_tool_cli.exe: CLI version (if available)
+        - csv_export_config.toml: Configuration file
+        - version.txt: Version information
+        
+        Usage:
+        1. Extract all files to the same directory
+        2. Double-click query_tool.exe to run GUI version
+        3. Or run query_tool_cli.exe --help in command line
+        
+        Note:
+        - First run may take a few seconds to start
+        - Some antivirus software may report false positives, add to whitelist if needed
+        - For detailed usage instructions, see USER_GUIDE.md
+        "@
         $readme | Out-File -FilePath "$releaseDir\README.txt" -Encoding utf8
         
         Write-Host "✓ Release package created in $releaseDir"

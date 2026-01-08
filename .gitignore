@@ -45,8 +45,3 @@ Thumbs.db
 # 打包输出
 dist/
 build/
-
-# 临时文件
-*.tmp
-*.log
-version.txt
