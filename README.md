@@ -1,216 +1,219 @@
-# Query Tool
+# Remote Tool
 
-通过SSH连接远程服务器，查询SQLite数据库并导出为CSV的工具。
+通过SSH连接远程服务器，进行数据查询和应用部署的工具。
 
 ## 功能特性
 
-- ✅ **SSH连接**：支持密码和密钥文件认证
-- ✅ **SQL查询**：支持按时间范围、设备序列号查询
+- ✅ **SSH连接**：支持密码和密钥文件认证，连接状态在数据查询和应用部署模块间共享
+- ✅ **数据查询**：支持按时间范围、设备序列号查询SQLite数据库
+  - 设备数据查询
+  - 指令数据查询
+  - 宽表查询
 - ✅ **CSV导出**：将查询结果导出为CSV格式（Excel兼容）
-- ✅ **图形界面**：提供Tkinter GUI界面，操作简单直观
-- ✅ **命令行接口**：提供CLI工具，方便脚本化使用和自动化
-- ✅ **跨平台**：支持Windows和Linux
-- ✅ **模块化设计**：可作为Python库集成到其他项目
+- ✅ **应用部署**：通过SSH部署应用程序到远程服务器
+  - 文件上传（可执行文件、配置文件、拓扑文件）
+  - 服务管理（systemd服务创建、启动、停止）
+  - 部署状态检查
+- ✅ **现代化UI**：基于Vue 3 + TypeScript的现代化界面
+- ✅ **自动更新**：支持从GitHub Releases自动更新
+- ✅ **跨平台**：支持Windows、Linux、macOS
+
+## 技术栈
+
+- **后端**: Rust + Tauri
+- **前端**: Vue 3 + TypeScript + Vite
+- **状态管理**: Pinia
+- **自动更新**: Tauri Updater
 
 ## 快速开始
 
-### Windows 用户
+### 下载安装
 
-1. 从 [Releases](https://github.com/huluzhou/query-tool/releases) 下载最新版本的压缩包
-2. 解压到任意目录
-3. 双击 `query_tool.exe` 运行
+1. 从 [Releases](https://github.com/huluzhou/remote-tool/releases) 下载最新版本的安装包
+2. 根据您的操作系统选择对应的安装包：
+   - Windows: `remote-tool_*_x64-setup.exe`
+   - Linux: `remote-tool_*_amd64.deb` 或 `remote-tool_*_amd64.AppImage`
+   - macOS: `remote-tool_*_x64.dmg` 或 `remote-tool_*_aarch64.dmg`
+3. 安装并运行
 
-### Linux 用户
+### 开发环境运行
 
-#### 安装依赖
+#### 前置要求
 
-```bash
-# Ubuntu/Debian
-sudo apt-get install python3-tk python3-venv
-
-# CentOS/RHEL
-sudo yum install python3-tkinter python3-venv
-```
+- Node.js 20+
+- Rust 1.70+
+- 系统依赖（Linux）:
+  ```bash
+  # Ubuntu/Debian
+  sudo apt-get update
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+  ```
 
 #### 安装和运行
 
 ```bash
 # 克隆仓库
-git clone https://github.com/huluzhou/query-tool.git
-cd query-tool
+git clone https://github.com/huluzhou/remote-tool.git
+cd remote-tool
 
-# 创建虚拟环境
-python3 -m venv venv
-source venv/bin/activate
+# 安装前端依赖
+npm install
 
-# 安装依赖
-pip install -r requirements.txt
+# 开发模式运行
+npm run tauri dev
 
-# 运行GUI
-python -m query_tool.ui.tkinter_ui
-
-# 或运行CLI
-python -m query_tool.cli -H 192.168.1.100 -u root -p password -s today -e now
+# 构建生产版本
+npm run tauri build
 ```
 
 ## 使用说明
 
-### 图形界面
+### 数据查询
 
-1. 启动程序：双击 `query_tool.exe`（Windows）或运行 `python -m query_tool.ui.tkinter_ui`（Linux）
-2. 配置SSH连接：输入服务器地址、端口、用户名、密码
-3. 配置查询：设置数据库路径、时间范围、设备序列号（可选）
-4. 执行查询：点击"执行查询"按钮
-5. 导出数据：点击"导出为CSV"按钮
+1. **连接SSH服务器**
+   - 在"SSH连接配置"区域输入SSH连接指令（格式：`ssh user@host -p port`）
+   - 输入密码
+   - 点击"连接"按钮
 
-详细使用说明请参考 [用户手册](USER_GUIDE.md)。
+2. **配置查询参数**
+   - 选择查询类型（设备数据/指令数据/宽表）
+   - 设置数据库路径
+   - 设置时间范围（可使用快捷按钮：今天/昨天/最近7天）
+   - 如需要，输入设备序列号
+   - 选择是否包含扩展表数据
 
-### 命令行
+3. **执行查询**
+   - 点击"执行查询"按钮
+   - 查看查询结果（支持分页浏览）
 
-```bash
-# 基本用法 - 查询今天的数据
-python -m query_tool.cli -H 192.168.1.100 -u root -p password -s today -e now -o result.csv
+4. **导出数据**
+   - 点击"导出为CSV"按钮
+   - 选择保存位置
+   - 数据将导出为CSV格式
 
-# 查询指定设备最近7天的数据
-python -m query_tool.cli -H 192.168.1.100 -u root -p password \
-    -s 7days -e now --device-sn METER001 -o meter_data.csv
+### 应用部署
 
-# 查询指定时间范围的数据
-python -m query_tool.cli -H 192.168.1.100 -u root -p password \
-    -s "2024-01-01" -e "2024-01-31" --device-sn METER001 -o meter_data.csv
+1. **连接SSH服务器**（与数据查询共用连接）
 
-# 使用SSH密钥文件认证
-python -m query_tool.cli -H 192.168.1.100 -u root -k ~/.ssh/id_rsa \
-    -s today -e now -o result.csv
+2. **配置部署选项**
+   - 选择可执行文件路径
+   - 选择是否上传配置文件（config.toml）
+   - 选择是否上传拓扑文件（topo.json）
+   - 选择运行用户（普通用户/root用户）
+   - 选择是否部署后启动服务
 
-# 指定数据库路径
-python -m query_tool.cli -H 192.168.1.100 -u root -p password \
-    -d /opt/analysis/data/device_data.db -s today -e now -o result.csv
-```
+3. **执行部署**
+   - 点击"开始部署"按钮
+   - 查看部署日志
+   - 部署完成后检查服务状态
 
-**支持的时间格式：**
-- 时间戳：`1704067200`
-- 日期：`2024-01-01`
-- 日期时间：`2024-01-01 12:00:00`
-- 关键字：`now`, `today`, `yesterday`, `7days`（表示最近7天）
-
-**CLI参数说明：**
-- `-H, --host`：SSH服务器地址（必需）
-- `-P, --port`：SSH端口（默认：22）
-- `-u, --username`：SSH用户名（默认：root）
-- `-p, --password`：SSH密码
-- `-k, --key-file`：SSH私钥文件路径
-- `-d, --db-path`：远程数据库文件路径（默认：/opt/analysis/data/device_data.db）
-- `-s, --start-time`：开始时间（必需）
-- `-e, --end-time`：结束时间（必需）
-- `--device-sn`：设备序列号（可选）
-- `--include-ext`：包含扩展表数据（默认：True）
-- `--no-ext`：不包含扩展表数据
-- `-o, --output`：输出CSV文件路径
-- `--format`：输出格式（csv/json，默认：csv）
-- `-v, --verbose`：详细输出
-
-## 作为Python库使用
-
-```python
-from query_tool import SSHClient, DBQuery, CSVExporter
-
-with SSHClient(host="192.168.1.100", username="root", password="password") as ssh:
-    db_query = DBQuery(ssh)
-    results = db_query.query_by_time_range(
-        db_path="/opt/analysis/data/device_data.db",
-        start_time=1704067200,
-        end_time=1704153600,
-        device_sn="METER001",
-        include_ext=True
-    )
-    formatted_results = CSVExporter.prepare_for_export(results)
-    CSVExporter.export_to_csv(formatted_results, "output.csv")
-```
+4. **检查部署状态**
+   - 点击"检查状态"按钮
+   - 查看服务安装、运行状态
 
 ## 项目结构
 
 ```
-query-tool/
-├── core/                  # 核心功能模块
-│   ├── ssh_client.py      # SSH连接管理
-│   ├── db_query.py        # 数据库查询
-│   ├── csv_export.py      # CSV导出
-│   └── deploy.py          # 部署相关
-├── ui/                    # 用户界面
-│   └── tkinter_ui.py      # Tkinter GUI界面
-├── cli.py                 # 命令行接口
-├── run_ui.py             # GUI启动脚本
-├── requirements.txt       # Python依赖
-├── csv_export_config.toml # CSV导出配置
-├── build_windows.spec     # Windows打包配置
-├── build_windows_cli.spec # Windows CLI打包配置
-├── README.md             # 项目说明
-└── USER_GUIDE.md         # 用户手册
+remote-tool/
+├── src-tauri/              # Tauri 后端（Rust）
+│   ├── src/
+│   │   ├── main.rs         # Tauri 应用入口
+│   │   ├── commands.rs     # Tauri 命令定义
+│   │   ├── ssh/            # SSH 客户端模块
+│   │   ├── query/          # 数据库查询模块
+│   │   ├── export/         # CSV 导出模块
+│   │   └── deploy/         # 部署模块
+│   ├── Cargo.toml          # Rust 依赖
+│   └── tauri.conf.json     # Tauri 配置（含自动更新）
+├── src/                     # Vue 3 前端
+│   ├── components/         # Vue 组件
+│   │   ├── SshConnection.vue    # SSH 连接组件（公共）
+│   │   ├── DataQuery/           # 数据查询模块
+│   │   └── AppDeploy/           # 应用部署模块
+│   ├── views/              # 页面视图
+│   │   ├── QueryView.vue   # 数据查询页面
+│   │   └── DeployView.vue  # 应用部署页面
+│   ├── stores/             # Pinia 状态管理
+│   ├── App.vue
+│   └── main.ts
+├── .github/workflows/      # GitHub Actions
+│   └── build-release.yml   # 构建和发布工作流
+└── README.md
 ```
-
-## 配置
-
-CSV导出字段可通过 `csv_export_config.toml` 配置文件自定义。详细配置说明请参考 [用户手册](USER_GUIDE.md)。
 
 ## 开发说明
 
 ### 本地开发
 
 ```bash
-# 克隆仓库
-git clone https://github.com/huluzhou/query-tool.git
-cd query-tool
-
-# 创建虚拟环境
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
 # 安装依赖
-pip install -r requirements.txt
+npm install
 
-# 运行GUI
-python run_ui.py
-# 或
-python -m query_tool.ui.tkinter_ui
+# 开发模式（热重载）
+npm run tauri dev
 
-# 运行CLI
-python -m query_tool.cli -H 192.168.1.100 -u root -p password -s today -e now
+# 构建生产版本
+npm run tauri build
 ```
 
-### 构建Windows可执行文件
+### 构建发布
 
-项目使用PyInstaller打包，通过GitHub Actions自动构建。手动构建方法：
+项目使用 GitHub Actions 自动构建和发布。当创建新的 Git 标签（格式：`v*`）时，会自动：
+
+1. 构建 Windows、Linux、macOS 多平台版本
+2. 创建 GitHub Release
+3. 上传构建产物
+4. 配置自动更新
+
+手动构建：
 
 ```bash
-# 安装PyInstaller
-pip install pyinstaller
+# 构建当前平台
+npm run tauri build
 
-# 构建GUI版本
-python -m PyInstaller build_windows.spec --clean --noconfirm
-
-# 构建CLI版本
-python -m PyInstaller build_windows_cli.spec --clean --noconfirm
+# 构建指定平台（需要交叉编译工具链）
+npm run tauri build -- --target x86_64-pc-windows-msvc
+npm run tauri build -- --target x86_64-unknown-linux-gnu
+npm run tauri build -- --target x86_64-apple-darwin
 ```
 
-构建产物位于 `dist/` 目录。
+## 自动更新
+
+应用支持从 GitHub Releases 自动更新：
+
+1. 配置 `src-tauri/tauri.conf.json` 中的 `updater` 设置
+2. 设置 GitHub Secrets：
+   - `TAURI_SIGNING_PRIVATE_KEY`: 签名私钥
+   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: 私钥密码
+3. 应用启动时会自动检查更新
+4. 发现新版本时会提示用户下载和安装
 
 ## 故障排查
 
 ### SSH连接失败
 - 检查服务器地址、端口、用户名、密码是否正确
 - 检查防火墙设置
+- 确认SSH服务正在运行
 
 ### 数据库查询失败
 - 检查数据库路径是否正确
 - 确认数据库文件存在且有读取权限
+- 确认远程服务器已安装Python 3
 
-### CSV导出失败
-- 检查输出目录是否有写入权限
-- 确认磁盘空间充足
+### 应用部署失败
+- 检查可执行文件路径是否正确
+- 确认SSH用户有sudo权限
+- 检查远程服务器系统服务配置
 
-更多问题请参考 [用户手册](USER_GUIDE.md) 的"常见问题"部分。
+### 自动更新失败
+- 检查网络连接
+- 确认GitHub Releases中有新版本
+- 检查签名密钥配置
 
 ## 许可证
 
 本项目遵循与主项目相同的许可证。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
