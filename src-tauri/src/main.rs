@@ -7,7 +7,6 @@ mod query;
 mod export;
 mod deploy;
 
-use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()

@@ -33,7 +33,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
-import { check, install } from "@tauri-apps/plugin-updater";
+import { check } from "@tauri-apps/plugin-updater";
 import QueryView from "./views/QueryView.vue";
 import DeployView from "./views/DeployView.vue";
 
@@ -56,7 +56,7 @@ const checkUpdate = async () => {
     const update = await check();
     if (update?.available) {
       await update.downloadAndInstall();
-      await install();
+      // downloadAndInstall() 已经包含了安装功能，不需要单独调用 install()
     }
   } catch (error) {
     console.error("更新失败:", error);

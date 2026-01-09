@@ -1,0 +1,50 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E90FF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00BFFF;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="serverGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFFFFF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#F0F0F0;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- 背景圆形 -->
+  <circle cx="256" cy="256" r="230" fill="url(#bgGradient)"/>
+  
+  <!-- 服务器主体 -->
+  <rect x="156" y="136" width="200" height="280" rx="15" fill="url(#serverGradient)" stroke="#E0E0E0" stroke-width="2"/>
+  
+  <!-- 服务器上的3个单元（带指示灯和端口） -->
+  <!-- 单元1 -->
+  <circle cx="176" cy="200" r="6" fill="#32CD32"/>
+  <rect x="196" y="194" width="40" height="12" rx="3" fill="#C8C8C8"/>
+  
+  <!-- 单元2 -->
+  <circle cx="176" cy="260" r="6" fill="#32CD32"/>
+  <rect x="196" y="254" width="40" height="12" rx="3" fill="#C8C8C8"/>
+  
+  <!-- 单元3 -->
+  <circle cx="176" cy="320" r="6" fill="#32CD32"/>
+  <rect x="196" y="314" width="40" height="12" rx="3" fill="#C8C8C8"/>
+  
+  <!-- 连接线（从服务器到右上角） -->
+  <line x1="356" y1="276" x2="376" y2="136" stroke="#32CD32" stroke-width="8" stroke-linecap="round"/>
+  
+  <!-- 数据点（表示数据传输） -->
+  <circle cx="300" cy="240" r="8" fill="#FFD700"/>
+  <circle cx="320" cy="220" r="8" fill="#FFD700"/>
+  <circle cx="340" cy="200" r="8" fill="#FFD700"/>
+  
+  <!-- 网络连接符号（右上角） -->
+  <g transform="translate(380, 120)">
+    <circle cx="0" cy="0" r="20" fill="none" stroke="#FFFFFF" stroke-width="3"/>
+    <circle cx="-15" cy="-10" r="8" fill="#FFFFFF"/>
+    <circle cx="15" cy="-10" r="8" fill="#FFFFFF"/>
+    <circle cx="0" cy="10" r="8" fill="#FFFFFF"/>
+    <line x1="-15" y1="-10" x2="0" y2="0" stroke="#FFFFFF" stroke-width="2"/>
+    <line x1="15" y1="-10" x2="0" y2="0" stroke="#FFFFFF" stroke-width="2"/>
+    <line x1="0" y1="10" x2="0" y2="0" stroke="#FFFFFF" stroke-width="2"/>
+  </g>
+</svg>

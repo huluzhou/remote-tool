@@ -1,6 +1,6 @@
 use crate::ssh::SshClient;
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
+use anyhow::Result;
 
 #[derive(Debug, Deserialize)]
 pub struct DeployConfig {

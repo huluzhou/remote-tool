@@ -1,7 +1,7 @@
 use crate::ssh::SshClient;
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
+use anyhow::Result;
 
 #[derive(Debug, Deserialize)]
 pub struct QueryParams {
@@ -94,10 +94,11 @@ except Exception as e:
                 .cloned()
                 .collect();
             
+            let total_rows = results.len();
             Ok(QueryResult {
                 columns,
                 rows: results,
-                total_rows: results.len(),
+                total_rows,
             })
         }
         Err(e) => Err(format!("SSH command failed: {}", e)),

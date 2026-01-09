@@ -1,8 +1,8 @@
 use crate::ssh::{SshClient, SshConfig};
 use crate::query::{QueryParams, QueryResult};
-use crate::export::export_to_csv;
-use crate::deploy::{DeployConfig, DeployStatus, deploy_application, check_deploy_status};
-use serde::{Deserialize, Serialize};
+use crate::export;
+use crate::deploy::{DeployConfig, DeployStatus};
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct SshConfigDto {
@@ -48,19 +48,19 @@ pub async fn export_to_csv(
     data: serde_json::Value,
     file_path: String,
 ) -> Result<(), String> {
-    export_to_csv(data, file_path).await
+    export::export_to_csv(data, file_path).await
 }
 
 #[tauri::command]
 pub async fn check_deploy_status() -> Result<DeployStatus, String> {
-    check_deploy_status().await
+    crate::deploy::check_deploy_status().await
 }
 
 #[tauri::command]
 pub async fn deploy_application(
     config: DeployConfig,
 ) -> Result<serde_json::Value, String> {
-    match deploy_application(config).await {
+    match crate::deploy::deploy_application(config).await {
         Ok(logs) => Ok(serde_json::json!({
             "success": true,
             "logs": logs

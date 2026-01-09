@@ -6,10 +6,7 @@
         <input
           v-model="sshCommand"
           type="text"
-          placeholder="ssh user@host -p port"
-          @focus="onFocus"
-          @blur="onBlur"
-          :class="{ placeholder: isPlaceholder }"
+          placeholder="例如: ssh user@192.168.1.100 -p 22"
         />
       </div>
       <div class="form-group">
@@ -17,7 +14,7 @@
         <input
           v-model="password"
           type="password"
-          placeholder="输入SSH密码"
+          placeholder="请输入SSH登录密码（必填）"
         />
       </div>
       <div class="form-actions">
@@ -50,12 +47,10 @@ import { useSshStore } from "../stores/ssh";
 
 const sshStore = useSshStore();
 
-const sshCommand = ref("ssh user@host -p 2222");
+const sshCommand = ref("");
 const password = ref("");
 const connecting = ref(false);
 const error = ref("");
-
-const isPlaceholder = computed(() => sshCommand.value === "ssh user@host -p 2222");
 
 const connected = computed(() => sshStore.isConnected);
 
@@ -72,7 +67,7 @@ const parseSshCommand = (command: string): {
   port: number;
 } | null => {
   const trimmed = command.trim();
-  if (!trimmed || trimmed === "ssh user@host -p 2222") return null;
+  if (!trimmed) return null;
 
   // 移除 ssh 前缀
   const withoutSsh = trimmed.replace(/^ssh\s+/i, "");
@@ -127,17 +122,6 @@ const handleDisconnect = async () => {
   error.value = "";
 };
 
-const onFocus = () => {
-  if (isPlaceholder.value) {
-    sshCommand.value = "";
-  }
-};
-
-const onBlur = () => {
-  if (!sshCommand.value.trim()) {
-    sshCommand.value = "ssh user@host -p 2222";
-  }
-};
 
 onMounted(() => {
   if (sshStore.currentConnection) {
@@ -175,15 +159,69 @@ onMounted(() => {
 
 .form-group input {
   padding: 0.5rem;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: 1.5px solid #d0d0d0;
   border-radius: 4px;
-  background-color: rgba(255, 255, 255, 0.05);
-  color: inherit;
+  background-color: #ffffff;
+  color: #213547;
   font-size: 0.875rem;
+  transition: all 0.2s;
+  width: 100%;
+  box-sizing: border-box;
 }
 
-.form-group input.placeholder {
-  color: rgba(255, 255, 255, 0.5);
+/* 深色主题下的边框 */
+@media (prefers-color-scheme: dark) {
+  .form-group input {
+    border-color: rgba(255, 255, 255, 0.4);
+    background-color: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.87);
+  }
+}
+
+.form-group input:hover {
+  border-color: #999999;
+}
+
+@media (prefers-color-scheme: dark) {
+  .form-group input:hover {
+    border-color: rgba(255, 255, 255, 0.6);
+    background-color: rgba(255, 255, 255, 0.08);
+  }
+}
+
+.form-group input:focus {
+  outline: none;
+  border-color: #646cff;
+  background-color: #ffffff;
+  box-shadow: 0 0 0 2px rgba(100, 108, 255, 0.2);
+}
+
+@media (prefers-color-scheme: dark) {
+  .form-group input:focus {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+}
+
+.form-group input::placeholder {
+  color: #999999;
+  opacity: 1;
+}
+
+/* 深色主题下的 placeholder */
+@media (prefers-color-scheme: dark) {
+  .form-group input::placeholder {
+    color: rgba(255, 255, 255, 0.5);
+  }
+}
+
+.form-group input:placeholder-shown {
+  color: #999999;
+}
+
+@media (prefers-color-scheme: dark) {
+  .form-group input:placeholder-shown {
+    color: rgba(255, 255, 255, 0.7);
+  }
 }
 
 .form-actions {

@@ -46,7 +46,7 @@
   ```bash
   # Ubuntu/Debian
   sudo apt-get update
-  sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libglib2.0-dev libgdk-pixbuf-2.0-dev libpango1.0-dev libgtk-3-dev libgirepository1.0-dev
   ```
 
 #### 安装和运行

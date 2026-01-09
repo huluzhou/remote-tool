@@ -13,7 +13,7 @@
 ### Linux (Ubuntu/Debian)
 ```bash
 sudo apt-get update
-sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libglib2.0-dev libgdk-pixbuf-2.0-dev libpango1.0-dev libgtk-3-dev libgirepository1.0-dev
 ```
 
 ### macOS
@@ -179,15 +179,106 @@ git push origin v0.1.0
 ## 自动更新配置
 
 1. 生成签名密钥对：
-```bash
-tauri signer generate -w ~/.tauri/myapp.key
-```
+
+   由于 Tauri CLI 是作为项目依赖安装的，需要使用以下方式之一运行命令：
+
+   **方法 1：使用 npx（推荐）**
+   ```bash
+   npx tauri signer generate -w ~/.tauri/myapp.key
+   ```
+
+   **方法 2：全局安装 Tauri CLI（可选）**
+   ```bash
+   # 全局安装
+   npm install -g @tauri-apps/cli
+   
+   # 然后可以直接使用
+   tauri signer generate -w ~/.tauri/myapp.key
+   ```
+
+   **命令参数说明：**
+   - `-w, --write-keys <PATH>`: 指定私钥保存路径
+   - `-p, --password <PASSWORD>`: 设置私钥密码（可选，如果设置，需要在 GitHub Secrets 中配置）
+   - `-f, --force`: 如果密钥文件已存在，强制覆盖
+
+   **示例（带密码）：**
+   ```bash
+   npx tauri signer generate -w ~/.tauri/myapp.key -p "your-password"
+   ```
+
+   **注意：**
+   - 如果 `~/.tauri/` 目录不存在，命令会自动创建
+   - 生成密钥时如果没有使用 `-p` 参数，可能会提示输入密码，可以选择设置密码或留空
+   - 密钥文件会保存在 `~/.tauri/myapp.key`
+   - 同时会生成对应的公钥文件 `~/.tauri/myapp.key.pub`
+   - 公钥内容需要添加到 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey` 字段
 
 2. 将公钥添加到 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey` 字段
 
+   生成密钥后，需要将公钥内容添加到配置文件中：
+
+   ```bash
+   # 查看公钥内容
+   cat ~/.tauri/myapp.key.pub
+   ```
+
+   **重要：** Tauri signer 生成的公钥是 base64 编码格式，**不需要**添加 `-----BEGIN PUBLIC KEY-----` 和 `-----END PUBLIC KEY-----` 标记。直接复制整个 base64 字符串即可。
+
+   更新 `src-tauri/tauri.conf.json`：
+
+   ```json
+   {
+     "plugins": {
+       "updater": {
+         "active": true,
+         "endpoints": [
+           "https://github.com/huluzhou/remote-tool/releases/latest/download/{{target}}/{{current_version}}"
+         ],
+         "dialog": true,
+         "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU3NEFERTIyNUY5Nzk1MTUKUldRVmxaZGZJdDVLNTBmaGszYjArMkxLZFdBbTBDT0NocVJzcjNGYXhTMEQ5cWowcE1IbytlZnUK"
+       }
+     }
+   }
+   ```
+
+   **注意：**
+   - 直接复制整个 base64 字符串（通常是一行很长的字符串）
+   - 不需要添加任何标记或换行符
+   - 确保公钥字符串在 JSON 中用双引号包裹
+
 3. 将私钥添加到 GitHub Secrets：
-   - `TAURI_SIGNING_PRIVATE_KEY`
-   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+
+   **重要：选择 "Actions" 选项**
+   
+   由于签名密钥用于 GitHub Actions 工作流构建和发布应用，必须选择 **"Actions"** 而不是 Codespaces 或 Dependabot。
+
+   **详细步骤：**
+   
+   a. 访问你的 GitHub 仓库页面
+   
+   b. 点击仓库顶部的 **"Settings"**（设置）标签
+   
+   c. 在左侧边栏中，找到并点击 **"Secrets and variables"**（密钥和变量）
+   
+   d. 点击 **"Actions"**（不是 Codespaces 或 Dependabot）
+   
+   e. 点击右上角的 **"New repository secret"**（新建仓库密钥）按钮
+   
+   f. 添加第一个密钥：
+      - **Name（名称）**: `TAURI_SIGNING_PRIVATE_KEY`
+      - **Secret（密钥内容）**: 粘贴私钥文件的完整内容（通常是 `~/.tauri/myapp.key` 文件的内容）
+      - 点击 **"Add secret"**（添加密钥）
+   
+   g. 再次点击 **"New repository secret"**，添加第二个密钥：
+      - **Name（名称）**: `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+      - **Secret（密钥内容）**: 输入生成密钥时设置的密码（如果设置了密码）
+      - 点击 **"Add secret"**（添加密钥）
+   
+   **注意事项：**
+   - 私钥内容应该包含完整的文件内容，包括 `-----BEGIN PRIVATE KEY-----` 和 `-----END PRIVATE KEY-----` 标记
+   - 如果生成密钥时没有设置密码，`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 可以留空或设置为空字符串
+   - 密钥一旦添加后，GitHub 不会显示密钥内容，只能更新或删除
+   - 确保密钥安全，不要将私钥提交到代码仓库中
 
 ## 常见问题
 

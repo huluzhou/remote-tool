@@ -501,7 +501,9 @@ class QueryToolUI:
                 self.connection_status.config(text="已连接", foreground="green")
                 self.query_btn.config(state=tk.NORMAL)
                 self.deploy_btn.config(state=tk.NORMAL)
-                messagebox.showinfo("成功", f"SSH连接成功\n{username}@{host}:{port}")
+                # 连接成功后自动保存配置
+                self.save_config()
+                messagebox.showinfo("成功", f"SSH连接成功\n{username}@{host}:{port}\n\n配置已自动保存")
             else:
                 self.connection_status.config(text="连接失败", foreground="red")
                 # 显示详细的错误信息

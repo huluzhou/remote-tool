@@ -1,9 +1,8 @@
-use ssh2::Session;
-use std::io::prelude::*;
-use std::net::TcpStream;
+use async_ssh2_tokio::{Client, AuthMethod, ServerCheckMethod};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, Context};
 
+#[derive(Clone)]
 pub struct SshConfig {
     pub host: String,
     pub port: u16,
@@ -12,107 +11,132 @@ pub struct SshConfig {
     pub key_file: Option<String>,
 }
 
-pub struct SshClient {
-    session: Arc<Mutex<Session>>,
-}
+pub struct SshClient;
 
-static SSH_SESSION: Mutex<Option<Arc<Mutex<Session>>>> = Mutex::new(None);
+static SSH_CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
+static SSH_CONFIG: Mutex<Option<SshConfig>> = Mutex::new(None);
 
 impl SshClient {
+    /// 连接到 SSH 服务器（类似 paramiko 的连接方式，针对 JumpServer 优化）
     pub async fn connect(config: SshConfig) -> Result<()> {
-        let addr = format!("{}:{}", config.host, config.port);
-        let tcp = TcpStream::connect(&addr)
-            .with_context(|| format!("Failed to connect to {}", addr))?;
+        let addr = (&config.host[..], config.port);
         
-        let mut session = Session::new()?;
-        session.set_tcp_stream(tcp);
-        session.handshake()?;
-
-        // 尝试使用密钥文件
+        // 尝试使用密钥文件认证（类似 paramiko 的 key_filename）
+        // 注意：async-ssh2-tokio 默认只使用指定的认证方法，相当于 paramiko 的
+        // look_for_keys=False（不自动查找密钥）和 allow_agent=False（不使用 SSH 代理）
         if let Some(ref key_file) = config.key_file {
             if std::path::Path::new(key_file).exists() {
-                session.userauth_pubkey_file(
+                let auth = AuthMethod::with_key_file(key_file, None);
+                match Client::connect(
+                    addr,
                     &config.username,
-                    None,
-                    std::path::Path::new(key_file),
-                    None,
-                )?;
+                    auth,
+                    ServerCheckMethod::NoCheck, // 自动接受服务器密钥（类似 AutoAddPolicy）
+                )
+                    .await
+                {
+                    Ok(client) => {
+                        // 密钥认证成功
+                        let client_arc = Arc::new(client);
+                        *SSH_CLIENT.lock().unwrap() = Some(client_arc);
+                        *SSH_CONFIG.lock().unwrap() = Some(config);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("密钥认证失败: {}, 尝试密码认证", e);
+                        // 继续尝试密码
+                    }
+                }
             }
         }
-
-        // 如果密钥认证失败或没有密钥，尝试密码认证
-        if !session.authenticated() {
-            if let Some(ref password) = config.password {
-                session.userauth_password(&config.username, password)?;
-            } else {
-                anyhow::bail!("Authentication failed: no password or key file provided");
-            }
+        
+        // 使用密码认证（类似 paramiko 的 password）
+        // 注意：AuthMethod::with_password() 只使用密码认证，不会尝试密钥或代理
+        // 这相当于 paramiko 的 look_for_keys=False 和 allow_agent=False（对 JumpServer 很重要）
+        if let Some(ref password) = config.password {
+            let auth = AuthMethod::with_password(password);
+            let client = Client::connect(
+                addr,
+                &config.username,
+                auth,
+                ServerCheckMethod::NoCheck, // 自动接受服务器密钥（类似 AutoAddPolicy）
+            )
+                .await
+            .with_context(|| format!("SSH 连接失败: {}@{}:{}", config.username, config.host, config.port))?;
+            
+                let client_arc = Arc::new(client);
+                *SSH_CLIENT.lock().unwrap() = Some(client_arc);
+            *SSH_CONFIG.lock().unwrap() = Some(config);
+                Ok(())
+        } else {
+            anyhow::bail!(
+                "缺少认证信息\n\n\
+                服务器: {}:{}\n\
+                用户名: {}\n\n\
+                请提供密码或密钥文件",
+                config.host, config.port, config.username
+            )
         }
-
-        if !session.authenticated() {
-            anyhow::bail!("Authentication failed");
-        }
-
-        let session = Arc::new(Mutex::new(session));
-        *SSH_SESSION.lock().unwrap() = Some(session.clone());
-
-        Ok(())
     }
 
+    /// 断开 SSH 连接
     pub async fn disconnect() {
-        *SSH_SESSION.lock().unwrap() = None;
+        if let Some(client) = SSH_CLIENT.lock().unwrap().take() {
+            // Client 在 Drop 时会自动关闭连接
+            drop(client);
+        }
+        *SSH_CONFIG.lock().unwrap() = None;
     }
 
-    pub fn get_session() -> Result<Arc<Mutex<Session>>> {
-        SSH_SESSION
+    /// 获取 SSH 客户端
+    pub fn get_client() -> Result<Arc<Client>> {
+        SSH_CLIENT
             .lock()
             .unwrap()
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Not connected"))
-            .map(|s| s.clone())
+            .ok_or_else(|| anyhow::anyhow!("未连接，请先调用 connect()"))
+            .map(|c| c.clone())
     }
 
+    /// 执行 SSH 命令（类似 paramiko 的 exec_command）
     pub async fn execute_command(command: &str) -> Result<(i32, String, String)> {
-        let session = Self::get_session()?;
-        let mut channel = session.lock().unwrap().channel_session()?;
+        let client = Self::get_client()?;
         
-        channel.exec(command)?;
+        // 执行命令（async-ssh2-tokio 提供了便捷的 execute 方法）
+        let result = client
+            .execute(command)
+            .await
+            .with_context(|| format!("执行命令失败: {}", command))?;
         
-        let mut stdout = String::new();
-        channel.read_to_string(&mut stdout)?;
-        
-        let mut stderr = String::new();
-        channel.stderr().read_to_string(&mut stderr)?;
-        
-        channel.wait_close()?;
-        let exit_status = channel.exit_status()?;
-        
-        Ok((exit_status, stdout, stderr))
+        Ok((
+            result.exit_status as i32,
+            result.stdout,
+            result.stderr,
+        ))
     }
 
+    /// 上传文件到远程服务器（使用 SFTP，类似 paramiko 的 put）
     pub async fn upload_file(local_path: &str, remote_path: &str) -> Result<()> {
-        let session = Self::get_session()?;
-        let mut sftp = session.lock().unwrap().sftp()?;
+        let client = Self::get_client()?;
         
-        let mut local_file = std::fs::File::open(local_path)
-            .with_context(|| format!("Failed to open local file: {}", local_path))?;
-        
-        let mut remote_file = sftp.create(std::path::Path::new(remote_path))?;
-        
-        std::io::copy(&mut local_file, &mut remote_file)?;
+        // upload_file(本地路径, 远程路径, 权限, 块大小, 是否覆盖)
+        client
+            .upload_file(local_path, remote_path, None, None, true)
+            .await
+            .with_context(|| format!("上传文件失败: {} -> {}", local_path, remote_path))?;
         
         Ok(())
     }
 
+    /// 从远程服务器下载文件（使用 SFTP，类似 paramiko 的 get）
     pub async fn download_file(remote_path: &str, local_path: &str) -> Result<()> {
-        let session = Self::get_session()?;
-        let mut sftp = session.lock().unwrap().sftp()?;
+        let client = Self::get_client()?;
         
-        let mut remote_file = sftp.open(std::path::Path::new(remote_path))?;
-        let mut local_file = std::fs::File::create(local_path)
-            .with_context(|| format!("Failed to create local file: {}", local_path))?;
-        
-        std::io::copy(&mut remote_file, &mut local_file)?;
+        // download_file(远程路径, 本地路径)
+        client
+            .download_file(remote_path, local_path)
+            .await
+            .with_context(|| format!("下载文件失败: {} -> {}", remote_path, local_path))?;
         
         Ok(())
     }
