@@ -1,0 +1,9 @@
+identifier = "default"
+description = "Default capability set"
+windows = ["main"]
+local = true
+permissions = [
+  "core:default",
+  "dialog:default",
+  "updater:default"
+]

@@ -97,12 +97,14 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
+import { useQueryStore } from "../../stores/query";
 
 const emit = defineEmits<{
   query: [params: any];
 }>();
 
-const loading = ref(false);
+const queryStore = useQueryStore();
+const loading = computed(() => queryStore.loading);
 
 const formData = ref({
   dbPath: "/mnt/analysis/data/device_data.db",
@@ -166,6 +168,10 @@ const setEndTimeNow = () => {
 };
 
 const handleSubmit = () => {
+  if (loading.value) {
+    return; // 如果正在查询，不允许再次点击
+  }
+
   const startTime = parseTime(startTimeInput.value);
   const endTime = parseTime(endTimeInput.value);
 
@@ -173,8 +179,6 @@ const handleSubmit = () => {
     alert("请输入有效的时间范围");
     return;
   }
-
-  loading.value = true;
 
   const params = {
     dbPath: formData.value.dbPath,
@@ -186,10 +190,6 @@ const handleSubmit = () => {
   };
 
   emit("query", params);
-
-  setTimeout(() => {
-    loading.value = false;
-  }, 100);
 };
 </script>
 

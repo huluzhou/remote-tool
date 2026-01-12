@@ -103,16 +103,21 @@ const handleConnect = async () => {
   connecting.value = true;
   error.value = "";
 
-  const result = await sshStore.connect({
+  const config = {
     host: parsed.host,
     port: parsed.port,
     username: parsed.username,
     password: password.value,
-  });
+  };
+
+  const result = await sshStore.connect(config);
 
   connecting.value = false;
 
-  if (!result.success) {
+  if (result.success) {
+    // 连接成功，自动保存配置
+    saveSshConfig(sshCommand.value, password.value);
+  } else {
     error.value = result.error || "连接失败";
   }
 };
@@ -123,8 +128,40 @@ const handleDisconnect = async () => {
 };
 
 
+// 保存SSH配置到localStorage
+const saveSshConfig = (command: string, pwd: string) => {
+  try {
+    const config = {
+      sshCommand: command,
+      password: pwd, // 注意：密码以明文保存，实际应用中应该加密
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem("ssh_config", JSON.stringify(config));
+  } catch (e) {
+    console.error("保存SSH配置失败:", e);
+  }
+};
+
+// 从localStorage加载SSH配置
+const loadSshConfig = () => {
+  try {
+    const saved = localStorage.getItem("ssh_config");
+    if (saved) {
+      const config = JSON.parse(saved);
+      sshCommand.value = config.sshCommand || "";
+      password.value = config.password || "";
+    }
+  } catch (e) {
+    console.error("加载SSH配置失败:", e);
+  }
+};
+
 onMounted(() => {
-  if (sshStore.currentConnection) {
+  // 优先从localStorage加载保存的配置
+  loadSshConfig();
+  
+  // 如果localStorage中没有，则从store加载当前连接
+  if (!sshCommand.value && sshStore.currentConnection) {
     const conn = sshStore.currentConnection;
     sshCommand.value = `ssh ${conn.config.username}@${conn.config.host} -p ${conn.config.port}`;
     password.value = conn.config.password || "";
