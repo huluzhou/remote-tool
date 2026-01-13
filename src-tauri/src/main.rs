@@ -7,7 +7,6 @@ mod query;
 mod export;
 mod deploy;
 
-
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -21,6 +20,11 @@ fn main() {
             commands::check_deploy_status,
             commands::deploy_application,
         ])
+        .setup(|_app| {
+            // SSH 连接在断开时会自动清理资源
+            // 临时文件在查询过程中通过 Python 脚本和 trap 命令确保清理
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

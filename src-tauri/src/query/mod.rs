@@ -2,6 +2,7 @@ use crate::ssh::SshClient;
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +31,9 @@ pub async fn execute_query(params: QueryParams) -> Result<QueryResult, String> {
     
     let sql = build_query_sql(&params)?;
     
+    // 生成唯一的临时文件名，避免stdout缓冲区限制
+    let temp_file = format!("/tmp/query_result_{}.json", Uuid::new_v4().simple());
+    
     // 通过SSH执行Python脚本查询数据库
     let python_script = format!(
         r#"
@@ -37,6 +41,27 @@ import sqlite3
 import json
 import sys
 import base64
+import os
+import signal
+
+temp_file = "{}"
+
+# 定义清理函数，删除临时文件
+def cleanup():
+    try:
+        if os.path.exists(temp_file):
+            os.unlink(temp_file)
+    except Exception:
+        pass
+
+# 不注册 atexit，让 Rust 代码负责清理
+# 只在信号处理时清理（作为安全网）
+def signal_handler(signum, frame):
+    cleanup()
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 try:
     db_path = base64.b64decode("{}").decode('utf-8')
@@ -61,54 +86,149 @@ try:
                 row_dict[col] = value
         results.append(row_dict)
     
-    print(json.dumps(results, ensure_ascii=False, default=str))
+    # 将JSON写入临时文件，避免stdout缓冲区限制
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, default=str)
+    
+    # 验证文件是否成功创建
+    if not os.path.exists(temp_file):
+        raise Exception("Failed to create temp file: " + temp_file)
+    
+    # 验证文件大小
+    file_size = os.path.getsize(temp_file)
+    if file_size == 0:
+        raise Exception("Temp file is empty: " + temp_file)
+    
+    # 输出临时文件路径（不立即清理，由 Rust 代码负责清理）
+    print(temp_file, flush=True)
     
     conn.close()
+    # 正常退出时不清理，让 Rust 代码负责清理
     sys.exit(0)
 except Exception as e:
+    # 异常时清理
+    cleanup()
     error_msg = json.dumps({{"error": str(e)}}, ensure_ascii=False)
     print(error_msg, file=sys.stderr)
     sys.exit(1)
 "#,
+        temp_file,
         general_purpose::STANDARD.encode(&params.db_path),
         general_purpose::STANDARD.encode(&sql)
     );
 
-    let command = format!("python3 << 'EOF'\n{}\nEOF", python_script);
+    // 使用 trap 命令确保即使被强制终止也能清理临时文件
+    let command = format!("trap 'rm -f \"{}\" 2>/dev/null; exit 1' EXIT INT TERM; python3 << 'EOF'\n{}\nEOF", temp_file, python_script);
+    
+    // 记录临时文件路径，即使查询失败也要清理
+    let remote_temp_file = temp_file.clone();
     
     match SshClient::execute_command(&command).await {
         Ok((exit_status, stdout, stderr)) => {
+            // 如果执行失败，输出详细错误信息
             if exit_status != 0 {
-                return Err(format!("Query failed: {}", stderr));
+                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                let error_msg = if !stderr.trim().is_empty() {
+                    format!("Query failed: {}", stderr)
+                } else if !stdout.trim().is_empty() {
+                    format!("Query failed (stdout): {}", stdout)
+                } else {
+                    format!("Query failed with exit status: {}", exit_status)
+                };
+                return Err(error_msg);
             }
             
-            let results: Vec<serde_json::Value> = serde_json::from_str(&stdout)
-                .map_err(|e| format!("Failed to parse results: {}", e))?;
+            // 从stdout获取临时文件路径（去除所有空白字符）
+            let temp_file_path = stdout.trim().trim_end_matches('\n').trim_end_matches('\r').to_string();
             
-            if results.is_empty() {
-                return Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    total_rows: 0,
-                });
+            if temp_file_path.is_empty() {
+                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                return Err(format!("Failed to get temp file path from Python script. stdout: '{}', stderr: '{}'", stdout, stderr));
             }
             
-            // 提取列名
-            let columns: Vec<String> = results[0]
-                .as_object()
-                .ok_or("Invalid result format")?
-                .keys()
-                .cloned()
-                .collect();
+            // 验证远程文件是否存在，并获取文件信息
+            let check_cmd = format!("if [ -f \"{}\" ]; then ls -lh \"{}\" | awk '{{print $5}}' && echo 'exists'; else echo 'not found'; fi", temp_file_path, temp_file_path);
+            match SshClient::execute_command(&check_cmd).await {
+                Ok((_, check_output, _)) => {
+                    if !check_output.trim().contains("exists") {
+                        let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                        // 尝试列出 /tmp 目录看看文件是否在其他位置
+                        let debug_cmd = format!("ls -la /tmp/query_result_* 2>/dev/null | head -5 || echo 'no files found'");
+                        let debug_info = SshClient::execute_command(&debug_cmd).await
+                            .map(|(_, out, _)| format!("Debug: {}", out))
+                            .unwrap_or_else(|_| "Debug: failed to list files".to_string());
+                        return Err(format!("Remote temp file does not exist: {}. {}", temp_file_path, debug_info));
+                    }
+                }
+                Err(e) => {
+                    // 检查失败，但继续尝试下载
+                    eprintln!("Warning: Failed to check file existence: {}", e);
+                }
+            }
             
-            let total_rows = results.len();
-            Ok(QueryResult {
-                columns,
-                rows: results,
-                total_rows,
-            })
+            // 下载临时文件
+            let local_temp_file = std::env::temp_dir().join(format!("query_result_{}.json", Uuid::new_v4().simple()));
+            let local_temp_file_str = local_temp_file.to_str().ok_or("Invalid temp file path")?;
+            
+            // 确保清理本地临时文件
+            let cleanup_local = || {
+                let _ = std::fs::remove_file(&local_temp_file);
+            };
+            
+            match SshClient::download_file(&temp_file_path, local_temp_file_str).await {
+                Ok(_) => {
+                    // 读取文件内容
+                    let json_content = std::fs::read_to_string(&local_temp_file)
+                        .map_err(|e| {
+                            cleanup_local();
+                            format!("Failed to read temp file: {}", e)
+                        })?;
+                    
+                    // 清理本地临时文件
+                    cleanup_local();
+                    
+                    // 确保清理远程临时文件
+                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                    
+                    let results: Vec<serde_json::Value> = serde_json::from_str(&json_content)
+                        .map_err(|e| format!("Failed to parse results: {}", e))?;
+            
+                    if results.is_empty() {
+                        return Ok(QueryResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            total_rows: 0,
+                        });
+                    }
+                    
+                    // 提取列名
+                    let columns: Vec<String> = results[0]
+                        .as_object()
+                        .ok_or("Invalid result format")?
+                        .keys()
+                        .cloned()
+                        .collect();
+                    
+                    let total_rows = results.len();
+                    Ok(QueryResult {
+                        columns,
+                        rows: results,
+                        total_rows,
+                    })
+                }
+                Err(e) => {
+                    cleanup_local();
+                    // 确保清理远程临时文件
+                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                    Err(format!("Failed to download result file: {}", e))
+                }
+            }
         }
-        Err(e) => Err(format!("SSH command failed: {}", e)),
+        Err(e) => {
+            // SSH命令执行失败，确保清理远程临时文件
+            let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+            Err(format!("SSH command failed: {}", e))
+        }
     }
 }
 
@@ -157,6 +277,9 @@ fn build_query_sql(params: &QueryParams) -> Result<String, String> {
 async fn execute_wide_table_query(params: QueryParams) -> Result<QueryResult, String> {
     let include_ext = params.include_ext.unwrap_or(false);
     
+    // 生成唯一的临时文件名，避免stdout缓冲区限制
+    let temp_file = format!("/tmp/query_result_{}.json", Uuid::new_v4().simple());
+    
     // 构建宽表查询的Python脚本
     let python_script = format!(
         r#"
@@ -165,6 +288,27 @@ import json
 import sys
 import base64
 from collections import defaultdict
+import os
+import signal
+
+temp_file = "{}"
+
+# 定义清理函数，删除临时文件
+def cleanup():
+    try:
+        if os.path.exists(temp_file):
+            os.unlink(temp_file)
+    except Exception:
+        pass
+
+# 不注册 atexit，让 Rust 代码负责清理
+# 只在信号处理时清理（作为安全网）
+def signal_handler(signum, frame):
+    cleanup()
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 try:
     db_path = base64.b64decode("{}").decode('utf-8')
@@ -278,7 +422,7 @@ try:
         for key in data_fields:
             if key in row:
                 value = row[key]
-                column_name = f"{{{{device_sn}}}}_{{{{key}}}}"
+                column_name = f"{{device_sn}}_{{key}}"
                 wide_table[local_ts][column_name] = value
         
         # 如果包含扩展表数据，从 payload_json 中提取字段
@@ -300,7 +444,7 @@ try:
                             value = payload_data.get(field_key)
                             if value is not None:
                                 output_field_name = field_mapping.get(field_key, field_key)
-                                column_name = f"{{{{device_sn}}}}_{{{{output_field_name}}}}"
+                                column_name = f"{{device_sn}}_{{output_field_name}}"
                                 wide_table[local_ts][column_name] = value
                 except (json.JSONDecodeError, TypeError):
                     pass
@@ -322,7 +466,7 @@ try:
         if cmd_name:
             if cmd_device_sn:
                 # 使用设备序列号+指令名作为列名
-                column_name = f"{{{{cmd_device_sn}}}}_{{{{cmd_name}}}}"
+                column_name = f"{{cmd_device_sn}}_{{cmd_name}}"
             else:
                 # 如果没有设备序列号，直接使用指令名
                 column_name = cmd_name
@@ -332,67 +476,150 @@ try:
     result = list(wide_table.values())
     result.sort(key=lambda x: x.get('local_timestamp', 0))
     
-    print(json.dumps(result, ensure_ascii=False, default=str))
+    # 将JSON写入临时文件，避免stdout缓冲区限制
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, default=str)
+    
+    # 验证文件是否成功创建
+    if not os.path.exists(temp_file):
+        raise Exception("Failed to create temp file: " + temp_file)
+    
+    # 验证文件大小
+    file_size = os.path.getsize(temp_file)
+    if file_size == 0:
+        raise Exception("Temp file is empty: " + temp_file)
+    
+    # 输出临时文件路径（不立即清理，由 Rust 代码负责清理）
+    print(temp_file, flush=True)
     
     conn.close()
+    # 正常退出时不清理，让 Rust 代码负责清理
     sys.exit(0)
 except Exception as e:
+    # 异常时清理
+    cleanup()
     error_msg = json.dumps({{"error": str(e)}}, ensure_ascii=False)
     print(error_msg, file=sys.stderr)
     import traceback
     traceback.print_exc()
     sys.exit(1)
 "#,
+        temp_file,
         general_purpose::STANDARD.encode(&params.db_path),
         params.start_time,
         params.end_time,
         if include_ext { "True" } else { "False" }
     );
 
-    let command = format!("python3 << 'EOF'\n{}\nEOF", python_script);
+    // 使用 trap 命令确保即使被强制终止也能清理临时文件
+    let command = format!("trap 'rm -f \"{}\" 2>/dev/null; exit 1' EXIT INT TERM; python3 << 'EOF'\n{}\nEOF", temp_file, python_script);
+    
+    // 记录临时文件路径，即使查询失败也要清理
+    let remote_temp_file = temp_file.clone();
     
     match SshClient::execute_command(&command).await {
         Ok((exit_status, stdout, stderr)) => {
+            // 如果执行失败，确保清理临时文件
             if exit_status != 0 {
+                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
                 return Err(format!("Wide table query failed: {}", stderr));
             }
             
-            let results: Vec<serde_json::Value> = serde_json::from_str(&stdout)
-                .map_err(|e| format!("Failed to parse results: {}", e))?;
+            // 从stdout获取临时文件路径（去除所有空白字符）
+            let temp_file_path = stdout.trim().trim_end_matches('\n').trim_end_matches('\r').to_string();
             
-            if results.is_empty() {
-                return Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    total_rows: 0,
-                });
+            if temp_file_path.is_empty() {
+                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                return Err("Failed to get temp file path from Python script".to_string());
             }
             
-            // 提取列名（宽表的所有列）
-            let mut all_columns = std::collections::HashSet::new();
-            for row in &results {
-                if let Some(obj) = row.as_object() {
-                    for key in obj.keys() {
-                        all_columns.insert(key.clone());
+            // 验证远程文件是否存在
+            let check_cmd = format!("test -f \"{}\" && echo 'exists' || echo 'not found'", temp_file_path);
+            match SshClient::execute_command(&check_cmd).await {
+                Ok((_, check_output, _)) => {
+                    if !check_output.trim().contains("exists") {
+                        let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                        return Err(format!("Remote temp file does not exist: {}", temp_file_path));
                     }
+                }
+                Err(e) => {
+                    // 检查失败，但继续尝试下载
+                    eprintln!("Warning: Failed to check file existence: {}", e);
                 }
             }
             
-            let mut columns: Vec<String> = all_columns.into_iter().collect();
-            columns.sort();
-            // 确保 local_timestamp 在最前面
-            if let Some(pos) = columns.iter().position(|x| x == "local_timestamp") {
-                columns.remove(pos);
-                columns.insert(0, "local_timestamp".to_string());
-            }
+            // 下载临时文件
+            let local_temp_file = std::env::temp_dir().join(format!("query_result_{}.json", Uuid::new_v4().simple()));
+            let local_temp_file_str = local_temp_file.to_str().ok_or("Invalid temp file path")?;
             
-            let total_rows = results.len();
-            Ok(QueryResult {
-                columns,
-                rows: results,
-                total_rows,
-            })
+            // 确保清理本地临时文件
+            let cleanup_local = || {
+                let _ = std::fs::remove_file(&local_temp_file);
+            };
+            
+            match SshClient::download_file(&temp_file_path, local_temp_file_str).await {
+                Ok(_) => {
+                    // 读取文件内容
+                    let json_content = std::fs::read_to_string(&local_temp_file)
+                        .map_err(|e| {
+                            cleanup_local();
+                            format!("Failed to read temp file: {}", e)
+                        })?;
+                    
+                    // 清理本地临时文件
+                    cleanup_local();
+                    
+                    // 确保清理远程临时文件
+                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                    
+                    let results: Vec<serde_json::Value> = serde_json::from_str(&json_content)
+                        .map_err(|e| format!("Failed to parse results: {}", e))?;
+            
+                    if results.is_empty() {
+                        return Ok(QueryResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            total_rows: 0,
+                        });
+                    }
+                    
+                    // 提取列名（宽表的所有列）
+                    let mut all_columns = std::collections::HashSet::new();
+                    for row in &results {
+                        if let Some(obj) = row.as_object() {
+                            for key in obj.keys() {
+                                all_columns.insert(key.clone());
+                            }
+                        }
+                    }
+                    
+                    let mut columns: Vec<String> = all_columns.into_iter().collect();
+                    columns.sort();
+                    // 确保 local_timestamp 在最前面
+                    if let Some(pos) = columns.iter().position(|x| x == "local_timestamp") {
+                        columns.remove(pos);
+                        columns.insert(0, "local_timestamp".to_string());
+                    }
+                    
+                    let total_rows = results.len();
+                    Ok(QueryResult {
+                        columns,
+                        rows: results,
+                        total_rows,
+                    })
+                }
+                Err(e) => {
+                    cleanup_local();
+                    // 确保清理远程临时文件
+                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+                    Err(format!("Failed to download result file: {}", e))
+                }
+            }
         }
-        Err(e) => Err(format!("SSH command failed: {}", e)),
+        Err(e) => {
+            // SSH命令执行失败，确保清理远程临时文件
+            let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+            Err(format!("SSH command failed: {}", e))
+        }
     }
 }
