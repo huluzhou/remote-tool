@@ -76,14 +76,21 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { useDeployStore } from "../../stores/deploy";
 
 const emit = defineEmits<{
   deploy: [config: any];
 }>();
 
+const deployStore = useDeployStore();
 const deploying = ref(false);
+
+// 同步 store 的 deploying 状态
+watch(() => deployStore.deploying, (newValue) => {
+  deploying.value = newValue;
+}, { immediate: true });
 
 const formData = ref({
   binaryPath: "",
@@ -172,6 +179,11 @@ const selectTopoFile = async () => {
 };
 
 const handleSubmit = () => {
+  // 防止重复点击
+  if (deploying.value) {
+    return;
+  }
+  
   // 验证至少选择了一种文件上传
   if (!formData.value.uploadBinary && !formData.value.uploadConfig && !formData.value.uploadTopo) {
     alert("请至少选择一种文件进行上传");
@@ -205,9 +217,7 @@ const handleSubmit = () => {
     startService: formData.value.startService !== undefined ? formData.value.startService : true,
   };
   emit("deploy", deployConfig);
-  setTimeout(() => {
-    deploying.value = false;
-  }, 100);
+  // deploying 状态会通过 watch 监听 store 的状态自动更新
 };
 </script>
 
