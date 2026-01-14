@@ -266,157 +266,88 @@ fn prepare_for_export(data: &[Value], config: &ExportConfig) -> Vec<HashMap<Stri
     reorder_columns(formatted)
 }
 
-// 准备宽表查询数据用于导出
-fn prepare_wide_table_for_export(data: &[Value]) -> Vec<HashMap<String, Value>> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-    
-    let mut result = Vec::new();
-    
-    for row in data {
-        if let Some(obj) = row.as_object() {
-            let mut new_row: HashMap<String, Value> = obj.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            
-            // 格式化local_timestamp（毫秒级）
-            if let Some(local_timestamp) = new_row.get("local_timestamp") {
-                if let Some(ts) = local_timestamp.as_i64() {
-                    new_row.insert("local_timestamp".to_string(), Value::String(format_timestamp(ts, true)));
-                }
-            }
-            
-            result.push(new_row);
-        }
-    }
-    
-    // 重新排列列顺序：local_timestamp优先，其他列按字母顺序
-    result.into_iter().map(|row| {
-        let mut new_row = HashMap::new();
-        
-        // 先添加local_timestamp（如果存在）
-        if let Some(value) = row.get("local_timestamp") {
-            new_row.insert("local_timestamp".to_string(), value.clone());
-        }
-        
-        // 再添加其他列（按字母顺序）
-        let mut other_keys: Vec<String> = row.keys()
-            .filter(|k| *k != "local_timestamp")
-            .cloned()
-            .collect();
-        other_keys.sort();
-        
-        for key in other_keys {
-            if let Some(value) = row.get(&key) {
-                new_row.insert(key, value.clone());
-            }
-        }
-        
-        new_row
-    }).collect()
-}
-
-// 主导出函数
+// 主导出函数（从内存数据直接导出到CSV文件）
 pub async fn export_to_csv(
-    data: Value,
-    file_path: String,
+    data: crate::query::QueryResult,
+    output_path: String,
     query_type: Option<String>,
 ) -> Result<(), String> {
-    // 优先使用CSV文件路径（如果存在）
-    if let Some(csv_file_path) = data.get("csvFilePath")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-    {
-        // 如果CSV文件存在，直接复制并处理
-        if std::path::Path::new(&csv_file_path).exists() {
-            return export_from_csv_file(&csv_file_path, &file_path, query_type.as_deref()).await;
-        }
-    }
-    
-    // 回退到从JSON数据导出
-    let rows = data
-        .get("rows")
-        .and_then(|v| v.as_array())
-        .ok_or("Invalid data format")?;
-    
-    if rows.is_empty() {
-        return Err("No data to export".to_string());
-    }
-    
-    // 根据查询类型选择处理方式
-    let processed_data = match query_type.as_deref() {
-        Some("wide_table") => {
-            prepare_wide_table_for_export(rows)
-        }
+    match query_type.as_deref() {
+        Some("device") => export_device_data_from_memory(&data, &output_path).await,
+        Some("command") => export_command_data_from_memory(&data, &output_path).await,
+        Some("wide_table") => export_wide_table_from_memory(&data, &output_path).await,
         _ => {
-            let config = load_config();
-            prepare_for_export(rows, &config)
+            // 默认按设备数据处理（向后兼容）
+            export_device_data_from_memory(&data, &output_path).await
         }
+    }
+}
+
+// 从内存数据导出设备数据：处理payload_json字段提取、格式化时间戳、重新排列列顺序
+async fn export_device_data_from_memory(
+    data: &crate::query::QueryResult,
+    output_path: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    
+    // 检查是否包含payload_json字段
+    let has_payload_json = data.columns.iter().any(|h| h == "payload_json");
+    
+    // 加载配置
+    let config = load_config();
+    
+    // 如果包含payload_json，需要处理扩展表字段
+    let processed_data = if has_payload_json {
+        // 使用prepare_for_export处理数据（会提取payload_json中的字段）
+        prepare_for_export(&data.rows, &config)
+    } else {
+        // 没有payload_json，只格式化时间戳和重新排列列顺序
+        let filtered: Vec<HashMap<String, Value>> = data.rows.iter()
+            .filter_map(|row| row.as_object().map(|obj| {
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }))
+            .collect();
+        let formatted = add_formatted_timestamps(filtered);
+        reorder_columns(formatted)
     };
     
     if processed_data.is_empty() {
         return Err("No data to export after processing".to_string());
     }
     
-    // 获取列名顺序
-    // 对于普通查询，使用主表字段（按配置顺序）+ 扩展表字段（按字母顺序）
-    let fieldnames: Vec<String> = if query_type.as_deref() == Some("wide_table") {
-        // 宽表查询：使用local_timestamp优先，其他按字母顺序
-        let mut all_fieldnames = std::collections::HashSet::new();
-        for row in &processed_data {
-            all_fieldnames.extend(row.keys().cloned());
-        }
-        
-        let mut fieldnames: Vec<String> = all_fieldnames.into_iter().collect();
-        fieldnames.sort();
-        
-        // local_timestamp优先
-        if let Some(pos) = fieldnames.iter().position(|x| x == "local_timestamp") {
-            fieldnames.remove(pos);
-            fieldnames.insert(0, "local_timestamp".to_string());
-        }
-        
-        fieldnames
-    } else {
-        // 普通查询：主表字段（按配置顺序）+ 扩展表字段（按字母顺序）
-        let config = load_config();
-        let main_fields = &config.main_table_fields;
-        
-        let mut all_fieldnames = std::collections::HashSet::new();
-        for row in &processed_data {
-            all_fieldnames.extend(row.keys().cloned());
-        }
-        
-        let mut fieldnames: Vec<String> = Vec::new();
-        
-        // 1. 添加主表字段（按配置顺序，只包含实际存在的字段）
-        for field in main_fields {
-            if all_fieldnames.contains(field) {
-                fieldnames.push(field.clone());
-            }
-        }
-        
-        // 2. 添加扩展表字段（按字母顺序）
-        let mut ext_fields: Vec<String> = all_fieldnames.into_iter()
-            .filter(|f| !main_fields.contains(f))
-            .collect();
-        ext_fields.sort();
-        fieldnames.extend(ext_fields);
-        
-        fieldnames
-    };
+    // 收集所有行的所有字段名
+    let mut all_fieldnames = std::collections::HashSet::new();
+    for row in &processed_data {
+        all_fieldnames.extend(row.keys().cloned());
+    }
     
-    // 创建CSV写入器（使用UTF-8 BOM编码）
-    use std::io::Write;
-    let mut file = std::fs::File::create(&file_path)
-        .map_err(|e| format!("Failed to create CSV file: {}", e))?;
+    // 构建列名顺序：主表字段（按配置顺序）+ 扩展表字段（按字母顺序）
+    let main_fields = &config.main_table_fields;
+    let mut fieldnames: Vec<String> = Vec::new();
     
-    // 写入UTF-8 BOM
+    // 1. 添加主表字段（按配置顺序，只包含实际存在的字段）
+    for field in main_fields {
+        if all_fieldnames.contains(field) {
+            fieldnames.push(field.clone());
+        }
+    }
+    
+    // 2. 添加扩展表字段（按字母顺序）
+    let mut ext_fields: Vec<String> = all_fieldnames.iter()
+        .filter(|f| !main_fields.contains(f))
+        .cloned()
+        .collect();
+    ext_fields.sort();
+    fieldnames.extend(ext_fields);
+    
+    // 创建输出文件并写入UTF-8 BOM
+    let mut file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to create output file: {}", e))?;
+    
     file.write_all(&[0xEF, 0xBB, 0xBF])
         .map_err(|e| format!("Failed to write BOM: {}", e))?;
     
-    // 创建CSV写入器（追加模式，因为BOM已经写入）
+    // 创建CSV写入器
     let mut wtr = Writer::from_writer(file);
     
     // 写入表头
@@ -443,141 +374,115 @@ pub async fn export_to_csv(
     Ok(())
 }
 
-// 从CSV文件直接导出（处理payload_json字段提取）
-async fn export_from_csv_file(
-    csv_file_path: &str,
+// 从内存数据导出指令数据：格式化时间戳、保持原始列顺序
+async fn export_command_data_from_memory(
+    data: &crate::query::QueryResult,
     output_path: &str,
-    query_type: Option<&str>,
 ) -> Result<(), String> {
     use std::io::Write;
     
-    // 读取CSV文件并解析
-    let mut reader = csv::Reader::from_path(csv_file_path)
-        .map_err(|e| format!("Failed to read CSV file: {}", e))?;
+    // 创建输出文件并写入UTF-8 BOM
+    let mut file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to create output file: {}", e))?;
     
-    let headers = reader.headers()
-        .map_err(|e| format!("Failed to read CSV headers: {}", e))?
-        .clone();
+    file.write_all(&[0xEF, 0xBB, 0xBF])
+        .map_err(|e| format!("Failed to write BOM: {}", e))?;
     
-    // 检查是否包含payload_json字段
-    let has_payload_json = headers.iter().any(|h| h == "payload_json");
+    // 创建CSV写入器
+    let mut wtr = Writer::from_writer(file);
     
-    // 如果包含payload_json且不是wide_table查询，需要处理扩展表字段
-    if has_payload_json && query_type.as_deref() != Some("wide_table") {
-        // 加载配置
-        let config = load_config();
-        
-        // 读取所有行并转换为JSON格式
-        let mut rows = Vec::new();
-        for result in reader.records() {
-            let record = result.map_err(|e| format!("Failed to read CSV record: {}", e))?;
-            let mut row_obj = serde_json::Map::new();
-            
-            for (i, field) in record.iter().enumerate() {
-                if let Some(header) = headers.get(i) {
-                    let value: Value = if field.is_empty() {
-                        Value::Null
-                    } else {
-                        // 尝试转换为数字
-                        if let Ok(int_val) = field.parse::<i64>() {
-                            Value::Number(int_val.into())
-                        } else if let Ok(float_val) = field.parse::<f64>() {
-                            Value::Number(
-                                serde_json::Number::from_f64(float_val)
-                                    .unwrap_or_else(|| serde_json::Number::from(0))
-                            )
+    // 写入表头（保持原始顺序）
+    wtr.write_record(&data.columns)
+        .map_err(|e| format!("Failed to write header: {}", e))?;
+    
+    // 写入数据行（格式化时间戳字段）
+    for row in &data.rows {
+        if let Some(obj) = row.as_object() {
+            let mut record = Vec::new();
+            for col in &data.columns {
+                let value = obj.get(col);
+                let formatted_value = if col == "timestamp" || col == "local_timestamp" {
+                    if let Some(v) = value {
+                        if let Some(ts) = v.as_i64() {
+                            if col == "timestamp" {
+                                format_timestamp(ts, false)
+                            } else {
+                                format_timestamp(ts, true)
+                            }
                         } else {
-                            Value::String(field.to_string())
+                            format_value(value)
                         }
-                    };
-                    row_obj.insert(header.to_string(), value);
-                }
-            }
-            
-            rows.push(Value::Object(row_obj));
-        }
-        
-        // 使用prepare_for_export处理数据（会提取payload_json中的字段）
-        let processed_data = prepare_for_export(&rows, &config);
-        
-        if processed_data.is_empty() {
-            return Err("No data to export after processing".to_string());
-        }
-        
-        // 收集所有行的所有字段名
-        let mut all_fieldnames = std::collections::HashSet::new();
-        for row in &processed_data {
-            all_fieldnames.extend(row.keys().cloned());
-        }
-        
-        // 构建列名顺序：主表字段（按配置顺序）+ 扩展表字段（按字母顺序）
-        let main_fields = &config.main_table_fields;
-        let mut fieldnames: Vec<String> = Vec::new();
-        
-        // 1. 添加主表字段（按配置顺序，只包含实际存在的字段）
-        for field in main_fields {
-            if all_fieldnames.contains(field) {
-                fieldnames.push(field.clone());
-            }
-        }
-        
-        // 2. 添加扩展表字段（按字母顺序）
-        let mut ext_fields: Vec<String> = all_fieldnames.iter()
-            .filter(|f| !main_fields.contains(f))
-            .cloned()
-            .collect();
-        ext_fields.sort();
-        fieldnames.extend(ext_fields);
-        
-        // 创建输出文件并写入UTF-8 BOM
-        let mut file = std::fs::File::create(output_path)
-            .map_err(|e| format!("Failed to create output file: {}", e))?;
-        
-        file.write_all(&[0xEF, 0xBB, 0xBF])
-            .map_err(|e| format!("Failed to write BOM: {}", e))?;
-        
-        // 创建CSV写入器
-        let mut wtr = Writer::from_writer(file);
-        
-        // 写入表头
-        wtr.write_record(&fieldnames)
-            .map_err(|e| format!("Failed to write header: {}", e))?;
-        
-        // 写入数据
-        for row in &processed_data {
-            let record: Vec<String> = fieldnames
-                .iter()
-                .map(|col| {
-                    let value = row.get(col);
+                    } else {
+                        String::new()
+                    }
+                } else {
                     format_value(value)
-                })
-                .collect();
+                };
+                record.push(formatted_value);
+            }
             
             wtr.write_record(&record)
                 .map_err(|e| format!("Failed to write record: {}", e))?;
         }
-        
-        wtr.flush()
-            .map_err(|e| format!("Failed to flush CSV file: {}", e))?;
-        
-        Ok(())
-    } else {
-        // 如果没有payload_json或者是wide_table查询，直接复制文件
-        let csv_content = std::fs::read(csv_file_path)
-            .map_err(|e| format!("Failed to read CSV file: {}", e))?;
-        
-        // 创建输出文件并写入UTF-8 BOM + CSV内容
-        let mut output_file = std::fs::File::create(output_path)
-            .map_err(|e| format!("Failed to create output file: {}", e))?;
-        
-        // 写入UTF-8 BOM（Excel兼容）
-        output_file.write_all(&[0xEF, 0xBB, 0xBF])
-            .map_err(|e| format!("Failed to write BOM: {}", e))?;
-        
-        // 直接写入CSV内容
-        output_file.write_all(&csv_content)
-            .map_err(|e| format!("Failed to write CSV content: {}", e))?;
-        
-        Ok(())
     }
+    
+    wtr.flush()
+        .map_err(|e| format!("Failed to flush CSV file: {}", e))?;
+    
+    Ok(())
 }
+
+// 从内存数据导出宽表：格式化local_timestamp、保持原始列顺序
+async fn export_wide_table_from_memory(
+    data: &crate::query::QueryResult,
+    output_path: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    
+    // 创建输出文件并写入UTF-8 BOM
+    let mut file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to create output file: {}", e))?;
+    
+    file.write_all(&[0xEF, 0xBB, 0xBF])
+        .map_err(|e| format!("Failed to write BOM: {}", e))?;
+    
+    // 创建CSV写入器
+    let mut wtr = Writer::from_writer(file);
+    
+    // 写入表头（保持原始顺序）
+    wtr.write_record(&data.columns)
+        .map_err(|e| format!("Failed to write header: {}", e))?;
+    
+    // 写入数据行（格式化local_timestamp字段）
+    for row in &data.rows {
+        if let Some(obj) = row.as_object() {
+            let mut record = Vec::new();
+            for col in &data.columns {
+                let value = obj.get(col);
+                let formatted_value = if col == "local_timestamp" {
+                    if let Some(v) = value {
+                        if let Some(ts) = v.as_i64() {
+                            format_timestamp(ts, true)
+                        } else {
+                            format_value(value)
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    format_value(value)
+                };
+                record.push(formatted_value);
+            }
+            
+            wtr.write_record(&record)
+                .map_err(|e| format!("Failed to write record: {}", e))?;
+        }
+    }
+    
+    wtr.flush()
+        .map_err(|e| format!("Failed to flush CSV file: {}", e))?;
+    
+    Ok(())
+}
+

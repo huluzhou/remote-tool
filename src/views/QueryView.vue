@@ -95,6 +95,15 @@ const handleQuery = async (params: any) => {
 
 const handleExport = async (data: any) => {
   try {
+    // 检查是否有数据
+    if (!data || !data.rows || data.rows.length === 0) {
+      await message("没有可导出的数据", {
+        title: "错误",
+        kind: "error",
+      });
+      return;
+    }
+
     const filePath = await save({
       filters: [
         {
@@ -107,7 +116,11 @@ const handleExport = async (data: any) => {
 
     if (filePath) {
       await invoke("export_to_csv", { 
-        data, 
+        data: {
+          columns: data.columns,
+          rows: data.rows,
+          totalRows: data.totalRows,
+        },
         filePath,
         queryType: queryStore.queryType 
       });

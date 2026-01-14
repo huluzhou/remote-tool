@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use tempfile::NamedTempFile;
 use std::io::BufReader;
 use flate2::read::GzDecoder;
+use std::path::Path;
+use std::sync::OnceLock;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,7 +22,7 @@ pub struct QueryParams {
     pub query_type: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -220,10 +222,9 @@ except Exception as e:
     // 清理远程临时文件
     let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
     
-    // 解压CSV+Gzip文件并保存为CSV文件
-    let (csv_file_path, csv_content) = {
-        // 创建解压后的CSV文件路径
-        let csv_path = local_temp_path.replace(".gz", "");
+    // 解压CSV+Gzip文件并读取到内存（不保存到磁盘）
+    let csv_content = {
+        // 打开gzip文件并解压
         let file = std::fs::File::open(&local_temp_path)
             .map_err(|e| format!("打开压缩文件失败: {}", e))?;
         let decoder = GzDecoder::new(file);
@@ -235,13 +236,11 @@ except Exception as e:
         decoder_reader.read_to_end(&mut csv_content)
             .map_err(|e| format!("读取解压数据失败: {}", e))?;
         
-        // 保存CSV文件
-        std::fs::write(&csv_path, &csv_content)
-            .map_err(|e| format!("写入CSV文件失败: {}", e))?;
-        
-        add_query_log(app_handle_ref, &format!("CSV文件已保存: {}", csv_path));
-        (Some(csv_path), csv_content)
+        csv_content
     };
+    
+    // 数据已读取到内存，可以删除临时文件了
+    let _ = std::fs::remove_file(&local_temp_path);
     
     // 从内存中的CSV内容解析为JSON（供前端显示）
     let mut reader = csv::Reader::from_reader(csv_content.as_slice());
@@ -284,7 +283,8 @@ except Exception as e:
     
     add_query_log(app_handle_ref, &format!("查询返回 {} 行", results.len()));
     
-    Ok((results, columns, csv_file_path))
+    // 数据已在内存中，不需要文件路径（导出时从内存数据生成）
+    Ok((results, columns, None))
 }
 
 /// 获取表的所有列名（按数据库中的顺序）
@@ -406,10 +406,369 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
     })
 }
 
-async fn query_command_data(_params: QueryParams, _app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
-    panic!("Not implemented");
+async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
+    let app_handle_ref = app_handle.as_ref();
+    
+    add_query_log(app_handle_ref, "开始查询命令数据...");
+    
+    // 构建WHERE条件
+    let mut conditions = vec![
+        format!("timestamp >= {}", params.start_time),
+        format!("timestamp <= {}", params.end_time),
+    ];
+    
+    if let Some(ref device_sn) = params.device_sn {
+        // 转义单引号，防止SQL注入
+        let escaped_device_sn = device_sn.replace("'", "''");
+        conditions.push(format!("device_sn = '{}'", escaped_device_sn));
+        add_query_log(app_handle_ref, &format!("设备序列号: {}", device_sn));
+    }
+    
+    let where_clause = conditions.join(" AND ");
+    
+    // 构建SQL查询 - 查询cmd_data表
+    let sql = format!(
+        "SELECT id, timestamp, device_sn, name, value, local_timestamp FROM cmd_data WHERE {} ORDER BY timestamp ASC",
+        where_clause
+    );
+    
+    add_query_log(app_handle_ref, "执行SQL查询...");
+    
+    // 执行查询，获取结果、列名和CSV文件路径
+    let (results, columns, csv_file_path) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
+    
+    if results.is_empty() {
+        add_query_log(app_handle_ref, "查询结果为空");
+        return Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            total_rows: 0,
+            csv_file_path: None,
+        });
+    }
+    
+    let total_rows = results.len();
+    
+    add_query_log(app_handle_ref, &format!("查询完成，共 {} 行，{} 列", total_rows, columns.len()));
+    
+    Ok(QueryResult {
+        columns,
+        rows: results,
+        total_rows,
+        csv_file_path,
+    })
 }
 
-async fn execute_wide_table_query(_params: QueryParams, _app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
-    panic!("Not implemented");
+// 配置结构体（用于宽表查询）
+#[derive(Debug, Deserialize, Clone)]
+struct WideTableConfig {
+    main_table_fields: Vec<String>,
+    #[serde(default)]
+    extract_from_payload: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    field_name_mapping: HashMap<String, String>,
+}
+
+// 全局配置缓存
+static WIDE_TABLE_CONFIG: OnceLock<WideTableConfig> = OnceLock::new();
+
+// 默认配置
+fn default_wide_table_config() -> WideTableConfig {
+    WideTableConfig {
+        main_table_fields: vec![
+            "id".to_string(),
+            "device_sn".to_string(),
+            "device_type".to_string(),
+            "timestamp".to_string(),
+            "local_timestamp".to_string(),
+            "activePower".to_string(),
+            "reactivePower".to_string(),
+        ],
+        extract_from_payload: HashMap::new(),
+        field_name_mapping: HashMap::new(),
+    }
+}
+
+// 加载配置文件
+fn load_wide_table_config() -> WideTableConfig {
+    WIDE_TABLE_CONFIG.get_or_init(|| {
+        // 1. 优先从可执行文件同目录读取
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let config_path = exe_dir.join("csv_export_config.toml");
+                if config_path.exists() {
+                    if let Ok(config) = parse_wide_table_config_file(&config_path) {
+                        return config;
+                    }
+                }
+            }
+        }
+        
+        // 2. 从项目根目录读取
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = project_root.parent()
+            .map(|p| p.join("csv_export_config.toml"))
+            .unwrap_or_else(|| project_root.join("csv_export_config.toml"));
+        
+        if config_path.exists() {
+            if let Ok(config) = parse_wide_table_config_file(&config_path) {
+                return config;
+            }
+        }
+        
+        // 3. 使用默认配置
+        default_wide_table_config()
+    }).clone()
+}
+
+// 解析配置文件
+fn parse_wide_table_config_file(path: &Path) -> Result<WideTableConfig, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let config: WideTableConfig = toml::from_str(&content)?;
+    Ok(config)
+}
+
+async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
+    let app_handle_ref = app_handle.as_ref();
+    
+    add_query_log(app_handle_ref, "开始执行宽表查询...");
+    
+    // 加载配置
+    let config = load_wide_table_config();
+    
+    // 获取主表字段（排除元数据字段）
+    let metadata_fields: std::collections::HashSet<&str> = ["id", "device_sn", "device_type", "timestamp", "local_timestamp"]
+        .iter()
+        .copied()
+        .collect();
+    let main_table_fields: Vec<String> = config.main_table_fields
+        .iter()
+        .filter(|f| !metadata_fields.contains(f.as_str()))
+        .cloned()
+        .collect();
+    
+    add_query_log(app_handle_ref, &format!("主表数据字段: {:?}", main_table_fields));
+    
+    // 1. 查询所有设备数据（不限制device_sn）
+    add_query_log(app_handle_ref, "查询所有设备数据...");
+    let include_ext = params.include_ext.unwrap_or(false);
+    
+    let device_params = QueryParams {
+        db_path: params.db_path.clone(),
+        start_time: params.start_time,
+        end_time: params.end_time,
+        device_sn: None, // 查询所有设备
+        include_ext: Some(include_ext),
+        query_type: "device".to_string(),
+    };
+    
+    let device_result = query_device_data(device_params, app_handle.clone()).await?;
+    add_query_log(app_handle_ref, &format!("设备数据查询完成: {} 行", device_result.total_rows));
+    
+    // 2. 查询所有命令数据
+    add_query_log(app_handle_ref, "查询所有命令数据...");
+    let command_params = QueryParams {
+        db_path: params.db_path.clone(),
+        start_time: params.start_time,
+        end_time: params.end_time,
+        device_sn: None, // 查询所有设备
+        include_ext: None,
+        query_type: "command".to_string(),
+    };
+    
+    let command_result = query_command_data(command_params, app_handle.clone()).await?;
+    add_query_log(app_handle_ref, &format!("命令数据查询完成: {} 行", command_result.total_rows));
+    
+    // 3. 在内存中合并数据，按 local_timestamp 分组
+    add_query_log(app_handle_ref, "合并数据...");
+    
+    // 使用HashMap按local_timestamp（毫秒）分组
+    let mut wide_table: HashMap<i64, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+    
+    // 处理设备数据
+    for row in device_result.rows {
+        let row_obj = match row.as_object() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        let local_ts = row_obj.get("local_timestamp")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                // 如果local_timestamp是字符串，尝试解析
+                row_obj.get("local_timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+            });
+        
+        let local_ts = match local_ts {
+            Some(ts) => ts,
+            None => continue,
+        };
+        
+        // 如果该时间戳还没有记录，初始化
+        if !wide_table.contains_key(&local_ts) {
+            let mut init_row = serde_json::Map::new();
+            init_row.insert("local_timestamp".to_string(), serde_json::Value::Number(local_ts.into()));
+            wide_table.insert(local_ts, init_row);
+        }
+        
+        let device_sn = row_obj.get("device_sn")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        
+        let device_sn = match device_sn {
+            Some(sn) if !sn.is_empty() => sn,
+            _ => continue, // 如果没有设备序列号，跳过
+        };
+        
+        let device_type = row_obj.get("device_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        
+        // 添加主表字段（使用设备序列号作为前缀）
+        for field in &main_table_fields {
+            if let Some(value) = row_obj.get(field) {
+                let column_name = format!("{}_{}", device_sn, field);
+                wide_table.get_mut(&local_ts).unwrap().insert(column_name, value.clone());
+            }
+        }
+        
+        // 如果包含扩展表数据，从payload_json中提取字段
+        if include_ext {
+            if let Some(payload_json) = row_obj.get("payload_json") {
+                if !payload_json.is_null() {
+                    // 解析payload_json
+                    let payload_data: Option<serde_json::Map<String, serde_json::Value>> = match payload_json {
+                        serde_json::Value::String(s) => {
+                            serde_json::from_str(s).ok()
+                        },
+                        serde_json::Value::Object(map) => Some(map.clone()),
+                        _ => None,
+                    };
+                    
+                    if let Some(payload_map) = payload_data {
+                        // 获取该设备类型需要提取的字段列表
+                        let fields_to_extract = config.extract_from_payload
+                            .get(device_type)
+                            .or_else(|| config.extract_from_payload.get("default"))
+                            .cloned()
+                            .unwrap_or_default();
+                        
+                        // 提取字段，列名为设备序列号+字段名
+                        for field_key in fields_to_extract {
+                            if let Some(value) = payload_map.get(&field_key) {
+                                let column_name = format!("{}_{}", device_sn, field_key);
+                                wide_table.get_mut(&local_ts).unwrap().insert(column_name, value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 处理命令数据
+    for row in command_result.rows {
+        let row_obj = match row.as_object() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        let local_ts = row_obj.get("local_timestamp")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                row_obj.get("local_timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+            });
+        
+        let local_ts = match local_ts {
+            Some(ts) => ts,
+            None => continue,
+        };
+        
+        // 如果该时间戳还没有记录，初始化
+        if !wide_table.contains_key(&local_ts) {
+            let mut init_row = serde_json::Map::new();
+            init_row.insert("local_timestamp".to_string(), serde_json::Value::Number(local_ts.into()));
+            wide_table.insert(local_ts, init_row);
+        }
+        
+        let cmd_device_sn = row_obj.get("device_sn")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        
+        let cmd_name = row_obj.get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        
+        let cmd_value = row_obj.get("value").cloned();
+        
+        if let Some(name) = cmd_name {
+            let column_name = if let Some(sn) = cmd_device_sn {
+                if !sn.is_empty() {
+                    format!("{}_{}", sn, name)
+                } else {
+                    name.clone()
+                }
+            } else {
+                name.clone()
+            };
+            
+            if let Some(value) = cmd_value {
+                wide_table.get_mut(&local_ts).unwrap().insert(column_name, value);
+            }
+        }
+    }
+    
+    // 转换为列表并排序
+    let mut result_rows: Vec<serde_json::Value> = wide_table
+        .into_values()
+        .map(|map| serde_json::Value::Object(map))
+        .collect();
+    
+    result_rows.sort_by_key(|row| {
+        row.as_object()
+            .and_then(|obj| obj.get("local_timestamp"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    });
+    
+    add_query_log(app_handle_ref, &format!("数据合并完成: {} 行", result_rows.len()));
+    
+    // 提取所有列名（从所有行中收集）
+    let mut all_columns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &result_rows {
+        if let Some(obj) = row.as_object() {
+            for key in obj.keys() {
+                all_columns.insert(key.clone());
+            }
+        }
+    }
+    
+    // 将列名转换为有序列表（local_timestamp优先，然后按字母顺序）
+    let mut columns: Vec<String> = all_columns.into_iter().collect();
+    columns.sort_by(|a, b| {
+        if a == "local_timestamp" {
+            std::cmp::Ordering::Less
+        } else if b == "local_timestamp" {
+            std::cmp::Ordering::Greater
+        } else {
+            a.cmp(b)
+        }
+    });
+    
+    // 数据已在内存中，不需要生成CSV文件（导出时从内存数据生成）
+    let csv_file_path = None;
+    
+    let total_rows = result_rows.len();
+    add_query_log(app_handle_ref, &format!("宽表查询完成，共 {} 行，{} 列", total_rows, columns.len()));
+    
+    Ok(QueryResult {
+        columns,
+        rows: result_rows,
+        total_rows,
+        csv_file_path,
+    })
 }

@@ -53,7 +53,11 @@ pub async fn export_to_csv(
     file_path: String,
     query_type: Option<String>,
 ) -> Result<(), String> {
-    export::export_to_csv(data, file_path, query_type).await
+    // 将JSON值反序列化为QueryResult
+    let query_result: QueryResult = serde_json::from_value(data)
+        .map_err(|e| format!("解析查询结果失败: {}", e))?;
+    
+    export::export_to_csv(query_result, file_path, query_type).await
 }
 
 #[tauri::command]
