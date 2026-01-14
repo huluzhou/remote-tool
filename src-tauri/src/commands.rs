@@ -40,8 +40,11 @@ pub async fn ssh_disconnect() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn execute_query(params: QueryParams) -> Result<QueryResult, String> {
-    crate::query::execute_query(params).await
+pub async fn execute_query(
+    app: tauri::AppHandle,
+    params: QueryParams,
+) -> Result<QueryResult, String> {
+    crate::query::execute_query(params, Some(app)).await
 }
 
 #[tauri::command]

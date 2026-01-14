@@ -31,6 +31,8 @@ toml = "0.8"
 chrono = "0.4"
 base64 = "0.21"
 uuid = { version = "1.0", features = ["v4"] }
+tempfile = "3.8"
+flate2 = "1.0"
 
 [profile.release]
 # 优化编译选项：兼顾代码大小和运行速度

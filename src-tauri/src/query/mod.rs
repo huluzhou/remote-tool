@@ -3,6 +3,11 @@ use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use uuid::Uuid;
+use chrono::{Utc, FixedOffset, TimeZone};
+use std::collections::HashMap;
+use tempfile::NamedTempFile;
+use std::io::BufReader;
+use flate2::read::GzDecoder;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,605 +26,412 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<serde_json::Value>,
     pub total_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csv_file_path: Option<String>, // 保存解压后的CSV文件路径，供导出时直接使用
 }
 
-pub async fn execute_query(params: QueryParams) -> Result<QueryResult, String> {
-    // 宽表查询需要特殊处理
-    if params.query_type == "wide_table" {
-        return execute_wide_table_query(params).await;
-    }
-    
-    let sql = build_query_sql(&params)?;
-    
-    // 生成唯一的临时文件名，避免stdout缓冲区限制
-    let temp_file = format!("/tmp/query_result_{}.json", Uuid::new_v4().simple());
-    
-    // 通过SSH执行Python脚本查询数据库
-    let python_script = format!(
-        r#"
-import sqlite3
-import json
-import sys
-import base64
-import os
-import signal
-
-temp_file = "{}"
-
-# 定义清理函数，删除临时文件
-def cleanup():
-    try:
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-    except Exception:
-        pass
-
-# 不注册 atexit，让 Rust 代码负责清理
-# 只在信号处理时清理（作为安全网）
-def signal_handler(signum, frame):
-    cleanup()
-    sys.exit(1)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-try:
-    db_path = base64.b64decode("{}").decode('utf-8')
-    sql = base64.b64decode("{}").decode('utf-8')
-    
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    cursor.execute(sql)
-    
-    columns = [description[0] for description in cursor.description] if cursor.description else []
-    
-    results = []
-    for row in cursor.fetchall():
-        row_dict = {{}}
-        for i, col in enumerate(columns):
-            value = row[i]
-            if value is None:
-                row_dict[col] = None
-            else:
-                row_dict[col] = value
-        results.append(row_dict)
-    
-    # 将JSON写入临时文件，避免stdout缓冲区限制
-    with open(temp_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, default=str)
-    
-    # 验证文件是否成功创建
-    if not os.path.exists(temp_file):
-        raise Exception("Failed to create temp file: " + temp_file)
-    
-    # 验证文件大小
-    file_size = os.path.getsize(temp_file)
-    if file_size == 0:
-        raise Exception("Temp file is empty: " + temp_file)
-    
-    # 输出临时文件路径（不立即清理，由 Rust 代码负责清理）
-    print(temp_file, flush=True)
-    
-    conn.close()
-    # 正常退出时不清理，让 Rust 代码负责清理
-    sys.exit(0)
-except Exception as e:
-    # 异常时清理
-    cleanup()
-    error_msg = json.dumps({{"error": str(e)}}, ensure_ascii=False)
-    print(error_msg, file=sys.stderr)
-    sys.exit(1)
-"#,
-        temp_file,
-        general_purpose::STANDARD.encode(&params.db_path),
-        general_purpose::STANDARD.encode(&sql)
-    );
-
-    // 使用 trap 命令确保即使被强制终止也能清理临时文件
-    let command = format!("trap 'rm -f \"{}\" 2>/dev/null; exit 1' EXIT INT TERM; python3 << 'EOF'\n{}\nEOF", temp_file, python_script);
-    
-    // 记录临时文件路径，即使查询失败也要清理
-    let remote_temp_file = temp_file.clone();
-    
-    match SshClient::execute_command(&command).await {
-        Ok((exit_status, stdout, stderr)) => {
-            // 如果执行失败，输出详细错误信息
-            if exit_status != 0 {
-                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                let error_msg = if !stderr.trim().is_empty() {
-                    format!("Query failed: {}", stderr)
-                } else if !stdout.trim().is_empty() {
-                    format!("Query failed (stdout): {}", stdout)
-                } else {
-                    format!("Query failed with exit status: {}", exit_status)
-                };
-                return Err(error_msg);
-            }
-            
-            // 从stdout获取临时文件路径（去除所有空白字符）
-            let temp_file_path = stdout.trim().trim_end_matches('\n').trim_end_matches('\r').to_string();
-            
-            if temp_file_path.is_empty() {
-                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                return Err(format!("Failed to get temp file path from Python script. stdout: '{}', stderr: '{}'", stdout, stderr));
-            }
-            
-            // 验证远程文件是否存在，并获取文件信息
-            let check_cmd = format!("if [ -f \"{}\" ]; then ls -lh \"{}\" | awk '{{print $5}}' && echo 'exists'; else echo 'not found'; fi", temp_file_path, temp_file_path);
-            match SshClient::execute_command(&check_cmd).await {
-                Ok((_, check_output, _)) => {
-                    if !check_output.trim().contains("exists") {
-                        let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                        // 尝试列出 /tmp 目录看看文件是否在其他位置
-                        let debug_cmd = format!("ls -la /tmp/query_result_* 2>/dev/null | head -5 || echo 'no files found'");
-                        let debug_info = SshClient::execute_command(&debug_cmd).await
-                            .map(|(_, out, _)| format!("Debug: {}", out))
-                            .unwrap_or_else(|_| "Debug: failed to list files".to_string());
-                        return Err(format!("Remote temp file does not exist: {}. {}", temp_file_path, debug_info));
-                    }
-                }
-                Err(e) => {
-                    // 检查失败，但继续尝试下载
-                    eprintln!("Warning: Failed to check file existence: {}", e);
-                }
-            }
-            
-            // 下载临时文件
-            let local_temp_file = std::env::temp_dir().join(format!("query_result_{}.json", Uuid::new_v4().simple()));
-            let local_temp_file_str = local_temp_file.to_str().ok_or("Invalid temp file path")?;
-            
-            // 确保清理本地临时文件
-            let cleanup_local = || {
-                let _ = std::fs::remove_file(&local_temp_file);
-            };
-            
-            match SshClient::download_file(&temp_file_path, local_temp_file_str).await {
-                Ok(_) => {
-                    // 读取文件内容
-                    let json_content = std::fs::read_to_string(&local_temp_file)
-                        .map_err(|e| {
-                            cleanup_local();
-                            format!("Failed to read temp file: {}", e)
-                        })?;
-                    
-                    // 清理本地临时文件
-                    cleanup_local();
-                    
-                    // 确保清理远程临时文件
-                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                    
-                    let results: Vec<serde_json::Value> = serde_json::from_str(&json_content)
-                        .map_err(|e| format!("Failed to parse results: {}", e))?;
-            
-                    if results.is_empty() {
-                        return Ok(QueryResult {
-                            columns: Vec::new(),
-                            rows: Vec::new(),
-                            total_rows: 0,
-                        });
-                    }
-                    
-                    // 提取列名
-                    let columns: Vec<String> = results[0]
-                        .as_object()
-                        .ok_or("Invalid result format")?
-                        .keys()
-                        .cloned()
-                        .collect();
-                    
-                    let total_rows = results.len();
-                    Ok(QueryResult {
-                        columns,
-                        rows: results,
-                        total_rows,
-                    })
-                }
-                Err(e) => {
-                    cleanup_local();
-                    // 确保清理远程临时文件
-                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                    Err(format!("Failed to download result file: {}", e))
-                }
-            }
-        }
-        Err(e) => {
-            // SSH命令执行失败，确保清理远程临时文件
-            let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-            Err(format!("SSH command failed: {}", e))
-        }
-    }
+// 格式化时间戳为GMT+8时区字符串
+fn format_gmt8_time(timestamp: i64) -> String {
+    let beijing_tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let dt = Utc.timestamp_opt(timestamp, 0).unwrap().with_timezone(&beijing_tz);
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn build_query_sql(params: &QueryParams) -> Result<String, String> {
-    let mut conditions = vec![
-        format!("timestamp >= {}", params.start_time),
-        format!("timestamp <= {}", params.end_time),
-    ];
+// 添加带时间戳的日志并发送事件
+fn add_query_log(app_handle: Option<&tauri::AppHandle>, message: &str) {
+    let beijing_tz = FixedOffset::east_opt(8 * 3600).unwrap();
+    let now = Utc::now().with_timezone(&beijing_tz);
+    let log_message = format!("[{}] {}", now.format("%H:%M:%S"), message);
     
-    if let Some(ref device_sn) = params.device_sn {
-        let escaped = device_sn.replace("'", "''");
-        conditions.push(format!("device_sn = '{}'", escaped));
+    // 发送事件到前端
+    if let Some(handle) = app_handle {
+        use tauri::Emitter;
+        let _ = handle.emit("query-log", &log_message);
     }
     
-    let where_clause = conditions.join(" AND ");
+    // 同时输出到控制台
+    eprintln!("{}", log_message);
+}
+
+pub async fn execute_query(
+    params: QueryParams,
+    app_handle: Option<tauri::AppHandle>,
+) -> Result<QueryResult, String> {
+    let app_handle_ref = app_handle.as_ref();
+    
+    // 记录查询开始信息
+    add_query_log(app_handle_ref, "开始执行查询...");
+    add_query_log(app_handle_ref, &format!("查询类型: {}", params.query_type));
+    add_query_log(app_handle_ref, &format!("数据库路径: {}", params.db_path));
+    
+    // 使用GMT+8时区格式化时间范围
+    let start_time_str = format_gmt8_time(params.start_time);
+    let end_time_str = format_gmt8_time(params.end_time);
+    add_query_log(app_handle_ref, &format!("时间范围: {} - {}", start_time_str, end_time_str));
     
     match params.query_type.as_str() {
         "device" => {
-            let include_ext = params.include_ext.unwrap_or(false);
-            if include_ext {
-                Ok(format!(
-                    "SELECT d.*, e.payload_json as payload_json FROM device_data d LEFT JOIN device_data_ext e ON d.id = e.device_data_id WHERE {} ORDER BY d.timestamp ASC",
-                    where_clause
-                ))
-            } else {
-                Ok(format!(
-                    "SELECT * FROM device_data d WHERE {} ORDER BY d.timestamp ASC",
-                    where_clause
-                ))
-            }
+            return query_device_data(params, app_handle).await;
         }
         "command" => {
-            Ok(format!(
-                "SELECT id, timestamp, device_sn, name, value, local_timestamp FROM cmd_data WHERE {} ORDER BY timestamp ASC",
-                where_clause
-            ))
+            return query_command_data(params, app_handle).await;
         }
         "wide_table" => {
-            // 宽表查询在execute_wide_table_query中处理，这里不需要SQL
-            Ok("".to_string())
+            return execute_wide_table_query(params, app_handle).await;
+        },   
+        _ => {
+            return Err(format!("Unknown query type: {}", params.query_type));
         }
-        _ => Err(format!("Unknown query type: {}", params.query_type)),
     }
 }
 
-async fn execute_wide_table_query(params: QueryParams) -> Result<QueryResult, String> {
-    let include_ext = params.include_ext.unwrap_or(false);
+/// 执行SQL查询并返回结果（通过SSH执行Python脚本）
+/// 返回 (结果数据, CSV文件路径)
+async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::AppHandle>) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+    let app_handle_ref = app_handle;
     
-    // 生成唯一的临时文件名，避免stdout缓冲区限制
-    let temp_file = format!("/tmp/query_result_{}.json", Uuid::new_v4().simple());
+    // 将SQL和路径进行base64编码，避免shell注入
+    let sql_b64 = general_purpose::STANDARD.encode(sql.as_bytes());
+    let db_path_b64 = general_purpose::STANDARD.encode(db_path.as_bytes());
     
-    // 构建宽表查询的Python脚本
-    let python_script = format!(
-        r#"
+    // 创建临时文件路径（CSV+Gzip格式）
+    let mut uuid_buffer = [0u8; 32];
+    let temp_file = format!("/tmp/query_result_{}.csv.gz", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
+    
+    // 创建Python脚本来执行查询
+    let python_script = format!(r#"
 import sqlite3
-import json
+import csv
+import gzip
 import sys
 import base64
-from collections import defaultdict
 import os
-import signal
-
-temp_file = "{}"
-
-# 定义清理函数，删除临时文件
-def cleanup():
-    try:
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-    except Exception:
-        pass
-
-# 不注册 atexit，让 Rust 代码负责清理
-# 只在信号处理时清理（作为安全网）
-def signal_handler(signum, frame):
-    cleanup()
-    sys.exit(1)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+import json
 
 try:
+    # 解码路径和SQL
     db_path = base64.b64decode("{}").decode('utf-8')
-    start_time = {}
-    end_time = {}
-    include_ext = {}
+    sql = base64.b64decode("{}").decode('utf-8')
+    temp_file = "{}"
     
+    # 连接数据库
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # 1. 查询所有设备数据（不限制device_sn）
-    device_sql = "SELECT d.*"
-    if include_ext:
-        device_sql += ", e.payload_json as payload_json FROM device_data d LEFT JOIN device_data_ext e ON d.id = e.device_data_id"
-    else:
-        device_sql += " FROM device_data d"
-    device_sql += f" WHERE d.timestamp >= {{start_time}} AND d.timestamp <= {{end_time}} ORDER BY d.timestamp ASC"
+    # 执行查询
+    cursor.execute(sql)
     
-    cursor.execute(device_sql)
-    device_data = []
-    for row in cursor.fetchall():
-        row_dict = {{}}
-        for key in row.keys():
-            value = row[key]
-            if value is None:
-                row_dict[key] = None
-            else:
-                row_dict[key] = value
-        device_data.append(row_dict)
+    # 获取列名
+    columns = [description[0] for description in cursor.description] if cursor.description else []
     
-    # 2. 查询指令数据
-    cmd_sql = f"SELECT id, timestamp, device_sn, name, value, local_timestamp FROM cmd_data WHERE timestamp >= {{start_time}} AND timestamp <= {{end_time}} ORDER BY timestamp ASC"
-    cursor.execute(cmd_sql)
-    command_data = []
-    for row in cursor.fetchall():
-        row_dict = {{}}
-        for key in row.keys():
-            value = row[key]
-            if value is None:
-                row_dict[key] = None
-            else:
-                row_dict[key] = value
-        command_data.append(row_dict)
+    if not columns:
+        # 如果没有列，创建空文件
+        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='') as f:
+            pass
+        print(temp_file)
+        conn.close()
+        sys.exit(0)
     
-    # 3. 加载CSV导出配置（如果存在）
-    import os
-    from pathlib import Path
-    try:
-        import toml
-        has_toml = True
-    except ImportError:
-        try:
-            import tomllib as toml
-            has_toml = True
-        except ImportError:
-            has_toml = False
-    
-    # 默认配置
-    main_table_fields = ["id", "device_sn", "device_type", "timestamp", "local_timestamp", "activePower", "reactivePower", "powerFactor"]
-    extract_config = {{}}
-    field_mapping = {{}}
-    
-    if has_toml:
-        # 尝试加载配置文件
-        config_paths = [
-            Path(db_path).parent / "csv_export_config.toml",
-            Path("/tmp") / "csv_export_config.toml",
-            Path.home() / "csv_export_config.toml",
-        ]
-        for config_path in config_paths:
-            if config_path.exists():
-                try:
-                    if hasattr(toml, 'load'):
-                        with open(config_path, 'r', encoding='utf-8') as f:
-                            config = toml.load(f)
-                    else:
-                        with open(config_path, 'rb') as f:
-                            config = toml.load(f)
-                    main_table_fields = config.get("main_table_fields", main_table_fields)
-                    extract_config = config.get("extract_from_payload", {{}})
-                    field_mapping = config.get("field_name_mapping", {{}})
-                    break
-                except Exception:
-                    pass
-    
-    # 排除元数据字段，只保留数据字段
-    metadata_fields = {{"id", "device_sn", "device_type", "timestamp", "local_timestamp"}}
-    data_fields = [f for f in main_table_fields if f not in metadata_fields]
-    
-    # 4. 按 local_timestamp 合并数据
-    wide_table = defaultdict(dict)
-    
-    # 处理设备数据
-    for row in device_data:
-        local_ts = row.get('local_timestamp')
-        if local_ts is None:
-            continue
+    # 将CSV写入临时文件并压缩，避免stdout缓冲区限制
+    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='') as gz_file:
+        writer = csv.DictWriter(gz_file, fieldnames=columns, extrasaction='ignore')
+        writer.writeheader()
         
-        # 使用 local_timestamp（毫秒）作为主键
-        if local_ts not in wide_table:
-            wide_table[local_ts]['local_timestamp'] = local_ts
-        
-        device_sn = row.get('device_sn', '')
-        device_type = row.get('device_type', '')
-        
-        if not device_sn:
-            continue
-        
-        # 添加主表字段（使用设备序列号作为前缀）
-        for key in data_fields:
-            if key in row:
-                value = row[key]
-                column_name = f"{{device_sn}}_{{key}}"
-                wide_table[local_ts][column_name] = value
-        
-        # 如果包含扩展表数据，从 payload_json 中提取字段
-        if include_ext and 'payload_json' in row:
-            payload_json = row.get('payload_json')
-            if payload_json:
-                try:
-                    if isinstance(payload_json, str):
-                        payload_data = json.loads(payload_json)
-                    else:
-                        payload_data = payload_json
-                    
-                    # 获取该设备类型需要提取的字段列表
-                    fields_to_extract = extract_config.get(device_type, extract_config.get('default', []))
-                    
-                    # 提取字段
-                    for field_key in fields_to_extract:
-                        if isinstance(payload_data, dict):
-                            value = payload_data.get(field_key)
-                            if value is not None:
-                                output_field_name = field_mapping.get(field_key, field_key)
-                                column_name = f"{{device_sn}}_{{output_field_name}}"
-                                wide_table[local_ts][column_name] = value
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        for row in cursor.fetchall():
+            row_dict = {{}}
+            for i, col in enumerate(columns):
+                value = row[i]
+                # 处理None值，转换为空字符串（CSV标准）
+                if value is None:
+                    row_dict[col] = ''
+                else:
+                    # 转换为字符串（CSV只支持字符串）
+                    row_dict[col] = str(value)
+            writer.writerow(row_dict)
     
-    # 处理指令数据
-    for cmd_row in command_data:
-        local_ts = cmd_row.get('local_timestamp')
-        if local_ts is None:
-            continue
-        
-        # 使用 local_timestamp（毫秒）作为主键
-        if local_ts not in wide_table:
-            wide_table[local_ts]['local_timestamp'] = local_ts
-        
-        cmd_device_sn = cmd_row.get('device_sn', '')
-        cmd_name = cmd_row.get('name', '')
-        cmd_value = cmd_row.get('value')
-        
-        if cmd_name:
-            if cmd_device_sn:
-                # 使用设备序列号+指令名作为列名
-                column_name = f"{{cmd_device_sn}}_{{cmd_name}}"
-            else:
-                # 如果没有设备序列号，直接使用指令名
-                column_name = cmd_name
-            wide_table[local_ts][column_name] = cmd_value
-    
-    # 转换为列表并排序
-    result = list(wide_table.values())
-    result.sort(key=lambda x: x.get('local_timestamp', 0))
-    
-    # 将JSON写入临时文件，避免stdout缓冲区限制
-    with open(temp_file, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, default=str)
-    
-    # 验证文件是否成功创建
-    if not os.path.exists(temp_file):
-        raise Exception("Failed to create temp file: " + temp_file)
-    
-    # 验证文件大小
-    file_size = os.path.getsize(temp_file)
-    if file_size == 0:
-        raise Exception("Temp file is empty: " + temp_file)
-    
-    # 输出临时文件路径（不立即清理，由 Rust 代码负责清理）
-    print(temp_file, flush=True)
+    # 输出临时文件路径
+    print(temp_file)
     
     conn.close()
-    # 正常退出时不清理，让 Rust 代码负责清理
     sys.exit(0)
 except Exception as e:
-    # 异常时清理
-    cleanup()
     error_msg = json.dumps({{"error": str(e)}}, ensure_ascii=False)
     print(error_msg, file=sys.stderr)
-    import traceback
-    traceback.print_exc()
     sys.exit(1)
-"#,
-        temp_file,
-        general_purpose::STANDARD.encode(&params.db_path),
-        params.start_time,
-        params.end_time,
-        if include_ext { "True" } else { "False" }
-    );
-
-    // 使用 trap 命令确保即使被强制终止也能清理临时文件
-    let command = format!("trap 'rm -f \"{}\" 2>/dev/null; exit 1' EXIT INT TERM; python3 << 'EOF'\n{}\nEOF", temp_file, python_script);
+"#, db_path_b64, sql_b64, temp_file);
+    println!("python_script: {}", python_script);
+    // 使用heredoc方式执行Python脚本
+    let mut eof_uuid_buffer = [0u8; 32];
+    let eof_uuid_str = Uuid::new_v4().simple().encode_lower(&mut eof_uuid_buffer);
+    let eof_marker = format!("PYTHON_SCRIPT_EOF_{}", &eof_uuid_str[..8]);
+    let command = format!("python3 << '{}'\n{}\n{}", eof_marker, python_script, eof_marker);
     
-    // 记录临时文件路径，即使查询失败也要清理
-    let remote_temp_file = temp_file.clone();
+    add_query_log(app_handle_ref, "执行SQL查询...");
     
-    match SshClient::execute_command(&command).await {
-        Ok((exit_status, stdout, stderr)) => {
-            // 如果执行失败，确保清理临时文件
-            if exit_status != 0 {
-                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                return Err(format!("Wide table query failed: {}", stderr));
-            }
-            
-            // 从stdout获取临时文件路径（去除所有空白字符）
-            let temp_file_path = stdout.trim().trim_end_matches('\n').trim_end_matches('\r').to_string();
-            
-            if temp_file_path.is_empty() {
-                let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                return Err("Failed to get temp file path from Python script".to_string());
-            }
-            
-            // 验证远程文件是否存在
-            let check_cmd = format!("test -f \"{}\" && echo 'exists' || echo 'not found'", temp_file_path);
-            match SshClient::execute_command(&check_cmd).await {
-                Ok((_, check_output, _)) => {
-                    if !check_output.trim().contains("exists") {
-                        let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                        return Err(format!("Remote temp file does not exist: {}", temp_file_path));
-                    }
-                }
-                Err(e) => {
-                    // 检查失败，但继续尝试下载
-                    eprintln!("Warning: Failed to check file existence: {}", e);
-                }
-            }
-            
-            // 下载临时文件
-            let local_temp_file = std::env::temp_dir().join(format!("query_result_{}.json", Uuid::new_v4().simple()));
-            let local_temp_file_str = local_temp_file.to_str().ok_or("Invalid temp file path")?;
-            
-            // 确保清理本地临时文件
-            let cleanup_local = || {
-                let _ = std::fs::remove_file(&local_temp_file);
-            };
-            
-            match SshClient::download_file(&temp_file_path, local_temp_file_str).await {
-                Ok(_) => {
-                    // 读取文件内容
-                    let json_content = std::fs::read_to_string(&local_temp_file)
-                        .map_err(|e| {
-                            cleanup_local();
-                            format!("Failed to read temp file: {}", e)
-                        })?;
-                    
-                    // 清理本地临时文件
-                    cleanup_local();
-                    
-                    // 确保清理远程临时文件
-                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                    
-                    let results: Vec<serde_json::Value> = serde_json::from_str(&json_content)
-                        .map_err(|e| format!("Failed to parse results: {}", e))?;
-            
-                    if results.is_empty() {
-                        return Ok(QueryResult {
-                            columns: Vec::new(),
-                            rows: Vec::new(),
-                            total_rows: 0,
-                        });
-                    }
-                    
-                    // 提取列名（宽表的所有列）
-                    let mut all_columns = std::collections::HashSet::new();
-                    for row in &results {
-                        if let Some(obj) = row.as_object() {
-                            for key in obj.keys() {
-                                all_columns.insert(key.clone());
-                            }
-                        }
-                    }
-                    
-                    let mut columns: Vec<String> = all_columns.into_iter().collect();
-                    columns.sort();
-                    // 确保 local_timestamp 在最前面
-                    if let Some(pos) = columns.iter().position(|x| x == "local_timestamp") {
-                        columns.remove(pos);
-                        columns.insert(0, "local_timestamp".to_string());
-                    }
-                    
-                    let total_rows = results.len();
-                    Ok(QueryResult {
-                        columns,
-                        rows: results,
-                        total_rows,
-                    })
-                }
-                Err(e) => {
-                    cleanup_local();
-                    // 确保清理远程临时文件
-                    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-                    Err(format!("Failed to download result file: {}", e))
-                }
-            }
-        }
-        Err(e) => {
-            // SSH命令执行失败，确保清理远程临时文件
-            let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
-            Err(format!("SSH command failed: {}", e))
-        }
+    // 执行命令
+    let (exit_status, stdout, stderr) = SshClient::execute_command(&command)
+        .await
+        .map_err(|e| format!("执行查询命令失败: {}", e))?;
+    
+    // 如果python3不存在，尝试python
+    let (exit_status, stdout, stderr) = if exit_status != 0 && stderr.to_lowercase().contains("command not found") {
+        add_query_log(app_handle_ref, "python3 未找到，尝试使用 python");
+        let command = format!("python << '{}'\n{}\n{}", eof_marker, python_script, eof_marker);
+        SshClient::execute_command(&command)
+            .await
+            .map_err(|e| format!("执行查询命令失败: {}", e))?
+    } else {
+        (exit_status, stdout, stderr)
+    };
+    
+    // 如果执行失败，处理错误
+    if exit_status != 0 {
+        // 尝试解析错误信息
+        let error_msg = if let Ok(error_data) = serde_json::from_str::<HashMap<String, String>>(&stderr) {
+            error_data.get("error").cloned().unwrap_or_else(|| stderr.clone())
+        } else {
+            stderr.clone()
+        };
+        return Err(format!("SQL查询失败: {}", error_msg));
     }
+    
+    // 从stdout获取远程临时文件路径
+    let remote_temp_file = stdout.trim();
+    add_query_log(app_handle_ref, &format!("远程临时文件: {}", remote_temp_file));
+    
+    // 创建本地临时文件（二进制模式，用于gzip文件）
+    let local_temp_file = NamedTempFile::new()
+        .map_err(|e| format!("创建本地临时文件失败: {}", e))?;
+    let local_temp_path = local_temp_file.path().to_string_lossy().to_string();
+    
+    // 使用SFTP下载文件
+    add_query_log(app_handle_ref, "下载查询结果文件...");
+    SshClient::download_file(remote_temp_file, &local_temp_path)
+        .await
+        .map_err(|e| format!("下载结果文件失败: {}", e))?;
+    
+    // 获取文件大小
+    let file_size = std::fs::metadata(&local_temp_path)
+        .map_err(|e| format!("获取文件信息失败: {}", e))?
+        .len();
+    add_query_log(app_handle_ref, &format!("文件下载成功: {} 字节 ({:.2} MB)", file_size, file_size as f64 / 1024.0 / 1024.0));
+    
+    // 清理远程临时文件
+    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
+    
+    // 解压CSV+Gzip文件并保存为CSV文件
+    let (csv_file_path, csv_content) = {
+        // 创建解压后的CSV文件路径
+        let csv_path = local_temp_path.replace(".gz", "");
+        let file = std::fs::File::open(&local_temp_path)
+            .map_err(|e| format!("打开压缩文件失败: {}", e))?;
+        let decoder = GzDecoder::new(file);
+        
+        // 将解压后的内容读取到内存
+        use std::io::Read;
+        let mut decoder_reader = BufReader::new(decoder);
+        let mut csv_content = Vec::new();
+        decoder_reader.read_to_end(&mut csv_content)
+            .map_err(|e| format!("读取解压数据失败: {}", e))?;
+        
+        // 保存CSV文件
+        std::fs::write(&csv_path, &csv_content)
+            .map_err(|e| format!("写入CSV文件失败: {}", e))?;
+        
+        add_query_log(app_handle_ref, &format!("CSV文件已保存: {}", csv_path));
+        (Some(csv_path), csv_content)
+    };
+    
+    // 从内存中的CSV内容解析为JSON（供前端显示）
+    let mut reader = csv::Reader::from_reader(csv_content.as_slice());
+    
+    let mut results = Vec::new();
+    let headers = reader.headers()
+        .map_err(|e| format!("读取CSV表头失败: {}", e))?
+        .clone();
+    
+    for record in reader.records() {
+        let record = record.map_err(|e| format!("读取CSV记录失败: {}", e))?;
+        let mut row = serde_json::Map::new();
+        
+        for (i, field) in record.iter().enumerate() {
+            let header = headers.get(i).unwrap_or("");
+            let value: serde_json::Value = if field.is_empty() {
+                serde_json::Value::Null
+            } else {
+                // 尝试转换为数字
+                if let Ok(int_val) = field.parse::<i64>() {
+                    serde_json::Value::Number(int_val.into())
+                } else if let Ok(float_val) = field.parse::<f64>() {
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(float_val)
+                            .unwrap_or_else(|| serde_json::Number::from(0))
+                    )
+                } else {
+                    serde_json::Value::String(field.to_string())
+                }
+            };
+            row.insert(header.to_string(), value);
+        }
+        
+        results.push(serde_json::Value::Object(row));
+    }
+    
+    add_query_log(app_handle_ref, &format!("查询返回 {} 行", results.len()));
+    
+    Ok((results, csv_file_path))
+}
+
+/// 获取表的所有列名
+async fn get_table_columns(db_path: &str, table_name: &str, app_handle: Option<&tauri::AppHandle>) -> Result<Vec<String>, String> {
+    let sql = format!("PRAGMA table_info({})", table_name);
+    let (results, _) = execute_sql_query(db_path, &sql, app_handle).await?;
+    
+    let columns: Vec<String> = results
+        .into_iter()
+        .filter_map(|row| {
+            row.as_object()?
+                .get("name")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .collect();
+    
+    Ok(columns)
+}
+
+async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
+    let app_handle_ref = app_handle.as_ref();
+    
+    add_query_log(app_handle_ref, "开始查询设备数据...");
+    
+    // 构建WHERE条件
+    let mut conditions = vec![
+        format!("d.timestamp >= {}", params.start_time),
+        format!("d.timestamp <= {}", params.end_time),
+    ];
+    
+    if let Some(ref device_sn) = params.device_sn {
+        // 转义单引号，防止SQL注入
+        let escaped_device_sn = device_sn.replace("'", "''");
+        conditions.push(format!("d.device_sn = '{}'", escaped_device_sn));
+        add_query_log(app_handle_ref, &format!("设备序列号: {}", device_sn));
+    }
+    
+    let where_clause = conditions.join(" AND ");
+    let include_ext = params.include_ext.unwrap_or(false);
+    
+    add_query_log(app_handle_ref, &format!("包含扩展表: {}", include_ext));
+    
+    // 构建SQL查询
+    // 使用固定的列顺序，确保CSV列顺序正确
+    let preferred_column_order = vec![
+        "id",
+        "device_sn",
+        "device_type",
+        "timestamp",
+        "local_timestamp",
+        "activePower",
+        "reactivePower",
+        "powerFactor",
+    ];
+    
+    let sql = if include_ext {
+        // 获取主表列名（用于验证列是否存在）
+        let available_columns = match get_table_columns(&params.db_path, "device_data", app_handle_ref).await {
+            Ok(cols) if !cols.is_empty() => {
+                // 使用HashSet快速查找
+                let cols_set: std::collections::HashSet<&str> = cols.iter().map(|s| s.as_str()).collect();
+                // 按照preferred顺序排列，只包含实际存在的列
+                preferred_column_order
+                    .iter()
+                    .filter(|col| cols_set.contains(*col))
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            },
+            _ => preferred_column_order.iter().map(|s| s.to_string()).collect(),
+        };
+        
+        let select_fields = available_columns
+            .iter()
+            .map(|col| format!("d.{}", col))
+            .collect::<Vec<_>>()
+            .join(", ");
+        
+        format!(
+            "SELECT {} , e.payload_json as payload_json FROM device_data d LEFT JOIN device_data_ext e ON d.id = e.device_data_id WHERE {} ORDER BY d.timestamp ASC",
+            select_fields, where_clause
+        )
+    } else {
+        // 只查询主表
+        let available_columns = match get_table_columns(&params.db_path, "device_data", app_handle_ref).await {
+            Ok(cols) if !cols.is_empty() => {
+                // 使用HashSet快速查找
+                let cols_set: std::collections::HashSet<&str> = cols.iter().map(|s| s.as_str()).collect();
+                // 按照preferred顺序排列，只包含实际存在的列
+                preferred_column_order
+                    .iter()
+                    .filter(|col| cols_set.contains(*col))
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            },
+            _ => preferred_column_order.iter().map(|s| s.to_string()).collect(),
+        };
+        
+        let select_fields = available_columns
+            .iter()
+            .map(|col| format!("d.{}", col))
+            .collect::<Vec<_>>()
+            .join(", ");
+        
+        format!(
+            "SELECT {} FROM device_data d WHERE {} ORDER BY d.timestamp ASC",
+            select_fields, where_clause
+        )
+    };
+    
+    add_query_log(app_handle_ref, "执行SQL查询...");
+    
+    // 执行查询
+    let (results, csv_file_path) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
+    
+    if results.is_empty() {
+        add_query_log(app_handle_ref, "查询结果为空");
+        return Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            total_rows: 0,
+            csv_file_path: None,
+        });
+    }
+    
+    // 从第一行获取列名
+    let total_rows = results.len();
+    let columns: Vec<String> = if let Some(first_row) = results.first() {
+        if let Some(obj) = first_row.as_object() {
+            obj.keys().cloned().collect()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+    
+    add_query_log(app_handle_ref, &format!("查询完成，共 {} 行，{} 列", total_rows, columns.len()));
+    
+    Ok(QueryResult {
+        columns,
+        rows: results,
+        total_rows,
+        csv_file_path,
+    })
+}
+
+async fn query_command_data(_params: QueryParams, _app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
+    panic!("Not implemented");
+}
+
+async fn execute_wide_table_query(_params: QueryParams, _app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
+    panic!("Not implemented");
 }

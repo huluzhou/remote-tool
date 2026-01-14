@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // 格式化时间为 GMT+8 时区
 function formatGMT8Time(timestamp: number): string {
@@ -32,6 +33,7 @@ export interface QueryResult {
   columns: string[];
   rows: Record<string, any>[];
   totalRows: number;
+  csvFilePath?: string; // 解压后的CSV文件路径，供导出时直接使用
 }
 
 export const useQueryStore = defineStore("query", {
@@ -58,6 +60,12 @@ export const useQueryStore = defineStore("query", {
       // 使用 GMT+8 时区格式化时间范围
       this.addLog(`时间范围: ${formatGMT8Time(params.startTime * 1000)} - ${formatGMT8Time(params.endTime * 1000)}`);
 
+      // 监听实时日志事件
+      const unlisten = await listen<string>("query-log", (event) => {
+        // 后端已经包含了时间戳，直接添加
+        this.logs.push(event.payload);
+      });
+
       try {
         this.addLog("正在连接数据库...");
         this.updateProgress(10, "正在连接数据库...");
@@ -79,6 +87,8 @@ export const useQueryStore = defineStore("query", {
         this.progressMessage = "查询失败";
         this.addLog(`查询失败: ${errorMsg}`);
       } finally {
+        // 取消事件监听
+        unlisten();
         this.loading = false;
       }
     },

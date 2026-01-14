@@ -102,11 +102,26 @@ impl SshClient {
     pub async fn execute_command(command: &str) -> Result<(i32, String, String)> {
         let client = Self::get_client()?;
         
+        // 记录命令执行开始时间
+        let start_time = std::time::Instant::now();
+        
+        // 截取命令的前100个字符用于日志（避免日志过长）
+        let cmd_preview = if command.len() > 100 {
+            format!("{}...", &command[..100])
+        } else {
+            command.to_string()
+        };
+        eprintln!("[SSH] 开始执行命令 (长度: {}): {}", command.len(), cmd_preview);
+        
         // 执行命令（async-ssh2-tokio 提供了便捷的 execute 方法）
         let result = client
             .execute(command)
             .await
             .with_context(|| format!("执行命令失败: {}", command))?;
+        
+        // 记录执行耗时
+        let elapsed = start_time.elapsed();
+        eprintln!("[SSH] 命令执行完成，耗时: {:.2}秒，退出码: {}", elapsed.as_secs_f64(), result.exit_status);
         
         Ok((
             result.exit_status as i32,
@@ -130,14 +145,29 @@ impl SshClient {
 
     /// 从远程服务器下载文件（使用 SFTP，类似 paramiko 的 get）
     pub async fn download_file(remote_path: &str, local_path: &str) -> Result<()> {
+        use tokio::time::{timeout, Duration};
+        
         let client = Self::get_client()?;
         
-        // download_file(远程路径, 本地路径)
-        client
-            .download_file(remote_path, local_path)
-            .await
-            .with_context(|| format!("下载文件失败: {} -> {}", remote_path, local_path))?;
+        // 记录下载开始时间
+        let start_time = std::time::Instant::now();
+        eprintln!("[SFTP] 开始下载文件: {} -> {}", remote_path, local_path);
         
-        Ok(())
+        // 添加超时机制（60分钟，对于大文件足够）
+        let download_future = client.download_file(remote_path, local_path);
+        match timeout(Duration::from_secs(60*60), download_future).await {
+            Ok(Ok(_)) => {
+                // 记录下载耗时
+                let elapsed = start_time.elapsed();
+                eprintln!("[SFTP] 文件下载完成，耗时: {:.2}秒", elapsed.as_secs_f64());
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                Err(e).with_context(|| format!("下载文件失败: {} -> {}", remote_path, local_path))
+            }
+            Err(_) => {
+                Err(anyhow::anyhow!("下载文件超时（超过60分钟）: {} -> {}", remote_path, local_path))
+            }
+        }
     }
 }

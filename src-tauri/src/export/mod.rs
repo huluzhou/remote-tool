@@ -303,6 +303,18 @@ pub async fn export_to_csv(
     file_path: String,
     query_type: Option<String>,
 ) -> Result<(), String> {
+    // 优先使用CSV文件路径（如果存在）
+    if let Some(csv_file_path) = data.get("csvFilePath")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        // 如果CSV文件存在，直接复制并处理
+        if std::path::Path::new(&csv_file_path).exists() {
+            return export_from_csv_file(&csv_file_path, &file_path, query_type.as_deref()).await;
+        }
+    }
+    
+    // 回退到从JSON数据导出
     let rows = data
         .get("rows")
         .and_then(|v| v.as_array())
@@ -375,6 +387,33 @@ pub async fn export_to_csv(
     
     wtr.flush()
         .map_err(|e| format!("Failed to flush CSV file: {}", e))?;
+    
+    Ok(())
+}
+
+// 从CSV文件直接导出（直接复制文件，仅添加UTF-8 BOM）
+async fn export_from_csv_file(
+    csv_file_path: &str,
+    output_path: &str,
+    _query_type: Option<&str>,
+) -> Result<(), String> {
+    use std::io::Write;
+    
+    // 读取原始CSV文件内容
+    let csv_content = std::fs::read(csv_file_path)
+        .map_err(|e| format!("Failed to read CSV file: {}", e))?;
+    
+    // 创建输出文件并写入UTF-8 BOM + CSV内容
+    let mut output_file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to create output file: {}", e))?;
+    
+    // 写入UTF-8 BOM（Excel兼容）
+    output_file.write_all(&[0xEF, 0xBB, 0xBF])
+        .map_err(|e| format!("Failed to write BOM: {}", e))?;
+    
+    // 直接写入CSV内容
+    output_file.write_all(&csv_content)
+        .map_err(|e| format!("Failed to write CSV content: {}", e))?;
     
     Ok(())
 }
