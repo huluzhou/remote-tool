@@ -86,8 +86,8 @@ pub async fn execute_query(
 }
 
 /// 执行SQL查询并返回结果（通过SSH执行Python脚本）
-/// 返回 (结果数据, CSV文件路径)
-async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::AppHandle>) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+/// 返回 (结果数据, 列名列表, CSV文件路径)
+async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::AppHandle>) -> Result<(Vec<serde_json::Value>, Vec<String>, Option<String>), String> {
     let app_handle_ref = app_handle;
     
     // 将SQL和路径进行base64编码，避免shell注入
@@ -251,10 +251,14 @@ except Exception as e:
         .map_err(|e| format!("读取CSV表头失败: {}", e))?
         .clone();
     
+    // 提取列名列表（保持CSV中的顺序，即数据库中的顺序）
+    let columns: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
+    
     for record in reader.records() {
         let record = record.map_err(|e| format!("读取CSV记录失败: {}", e))?;
         let mut row = serde_json::Map::new();
         
+        // 按照CSV headers的顺序插入，保持列顺序
         for (i, field) in record.iter().enumerate() {
             let header = headers.get(i).unwrap_or("");
             let value: serde_json::Value = if field.is_empty() {
@@ -280,15 +284,17 @@ except Exception as e:
     
     add_query_log(app_handle_ref, &format!("查询返回 {} 行", results.len()));
     
-    Ok((results, csv_file_path))
+    Ok((results, columns, csv_file_path))
 }
 
-/// 获取表的所有列名
+/// 获取表的所有列名（按数据库中的顺序）
 async fn get_table_columns(db_path: &str, table_name: &str, app_handle: Option<&tauri::AppHandle>) -> Result<Vec<String>, String> {
     let sql = format!("PRAGMA table_info({})", table_name);
-    let (results, _) = execute_sql_query(db_path, &sql, app_handle).await?;
+    let (results, _columns, _) = execute_sql_query(db_path, &sql, app_handle).await?;
     
-    let columns: Vec<String> = results
+    // PRAGMA table_info 返回的列顺序就是数据库中的列顺序
+    // 从结果中提取 name 字段，保持顺序
+    let table_columns: Vec<String> = results
         .into_iter()
         .filter_map(|row| {
             row.as_object()?
@@ -298,7 +304,7 @@ async fn get_table_columns(db_path: &str, table_name: &str, app_handle: Option<&
         })
         .collect();
     
-    Ok(columns)
+    Ok(table_columns)
 }
 
 async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
@@ -325,35 +331,20 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
     add_query_log(app_handle_ref, &format!("包含扩展表: {}", include_ext));
     
     // 构建SQL查询
-    // 使用固定的列顺序，确保CSV列顺序正确
-    let preferred_column_order = vec![
-        "id",
-        "device_sn",
-        "device_type",
-        "timestamp",
-        "local_timestamp",
-        "activePower",
-        "reactivePower",
-        "powerFactor",
-    ];
-    
+    // 使用数据库中的实际列顺序，而不是硬编码的顺序
     let sql = if include_ext {
-        // 获取主表列名（用于验证列是否存在）
-        let available_columns = match get_table_columns(&params.db_path, "device_data", app_handle_ref).await {
-            Ok(cols) if !cols.is_empty() => {
-                // 使用HashSet快速查找
-                let cols_set: std::collections::HashSet<&str> = cols.iter().map(|s| s.as_str()).collect();
-                // 按照preferred顺序排列，只包含实际存在的列
-                preferred_column_order
-                    .iter()
-                    .filter(|col| cols_set.contains(*col))
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
+        // 获取主表列名（按数据库中的顺序）
+        let main_columns = match get_table_columns(&params.db_path, "device_data", app_handle_ref).await {
+            Ok(cols) if !cols.is_empty() => cols,
+            _ => {
+                // 如果获取失败，使用默认列（按常见顺序）
+                vec!["id".to_string(), "device_sn".to_string(), "device_type".to_string(), 
+                     "timestamp".to_string(), "local_timestamp".to_string(), 
+                     "activePower".to_string(), "reactivePower".to_string(), "powerFactor".to_string()]
             },
-            _ => preferred_column_order.iter().map(|s| s.to_string()).collect(),
         };
         
-        let select_fields = available_columns
+        let select_fields = main_columns
             .iter()
             .map(|col| format!("d.{}", col))
             .collect::<Vec<_>>()
@@ -364,22 +355,18 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
             select_fields, where_clause
         )
     } else {
-        // 只查询主表
-        let available_columns = match get_table_columns(&params.db_path, "device_data", app_handle_ref).await {
-            Ok(cols) if !cols.is_empty() => {
-                // 使用HashSet快速查找
-                let cols_set: std::collections::HashSet<&str> = cols.iter().map(|s| s.as_str()).collect();
-                // 按照preferred顺序排列，只包含实际存在的列
-                preferred_column_order
-                    .iter()
-                    .filter(|col| cols_set.contains(*col))
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
+        // 只查询主表（使用数据库中的实际列顺序）
+        let main_columns = match get_table_columns(&params.db_path, "device_data", app_handle_ref).await {
+            Ok(cols) if !cols.is_empty() => cols,
+            _ => {
+                // 如果获取失败，使用默认列（按常见顺序）
+                vec!["id".to_string(), "device_sn".to_string(), "device_type".to_string(), 
+                     "timestamp".to_string(), "local_timestamp".to_string(), 
+                     "activePower".to_string(), "reactivePower".to_string(), "powerFactor".to_string()]
             },
-            _ => preferred_column_order.iter().map(|s| s.to_string()).collect(),
         };
         
-        let select_fields = available_columns
+        let select_fields = main_columns
             .iter()
             .map(|col| format!("d.{}", col))
             .collect::<Vec<_>>()
@@ -393,8 +380,8 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
     
     add_query_log(app_handle_ref, "执行SQL查询...");
     
-    // 执行查询
-    let (results, csv_file_path) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
+    // 执行查询，获取结果、列名和CSV文件路径
+    let (results, columns, csv_file_path) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
     
     if results.is_empty() {
         add_query_log(app_handle_ref, "查询结果为空");
@@ -406,17 +393,8 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
         });
     }
     
-    // 从第一行获取列名
+    // 使用从CSV headers中获取的列名（保持数据库中的顺序）
     let total_rows = results.len();
-    let columns: Vec<String> = if let Some(first_row) = results.first() {
-        if let Some(obj) = first_row.as_object() {
-            obj.keys().cloned().collect()
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
-    };
     
     add_query_log(app_handle_ref, &format!("查询完成，共 {} 行，{} 列", total_rows, columns.len()));
     
