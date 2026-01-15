@@ -28,8 +28,6 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<serde_json::Value>,
     pub total_rows: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub csv_file_path: Option<String>, // 保存解压后的CSV文件路径，供导出时直接使用
 }
 
 // 格式化时间戳为GMT+8时区字符串
@@ -88,8 +86,8 @@ pub async fn execute_query(
 }
 
 /// 执行SQL查询并返回结果（通过SSH执行Python脚本）
-/// 返回 (结果数据, 列名列表, CSV文件路径)
-async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::AppHandle>) -> Result<(Vec<serde_json::Value>, Vec<String>, Option<String>), String> {
+/// 返回 (结果数据, 列名列表)
+async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::AppHandle>) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
     let app_handle_ref = app_handle;
     
     // 将SQL和路径进行base64编码，避免shell注入
@@ -283,14 +281,13 @@ except Exception as e:
     
     add_query_log(app_handle_ref, &format!("查询返回 {} 行", results.len()));
     
-    // 数据已在内存中，不需要文件路径（导出时从内存数据生成）
-    Ok((results, columns, None))
+    Ok((results, columns))
 }
 
 /// 获取表的所有列名（按数据库中的顺序）
 async fn get_table_columns(db_path: &str, table_name: &str, app_handle: Option<&tauri::AppHandle>) -> Result<Vec<String>, String> {
     let sql = format!("PRAGMA table_info({})", table_name);
-    let (results, _columns, _) = execute_sql_query(db_path, &sql, app_handle).await?;
+    let (results, _columns) = execute_sql_query(db_path, &sql, app_handle).await?;
     
     // PRAGMA table_info 返回的列顺序就是数据库中的列顺序
     // 从结果中提取 name 字段，保持顺序
@@ -380,8 +377,8 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
     
     add_query_log(app_handle_ref, "执行SQL查询...");
     
-    // 执行查询，获取结果、列名和CSV文件路径
-    let (results, columns, csv_file_path) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
+    // 执行查询，获取结果和列名
+    let (results, columns) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
     
     if results.is_empty() {
         add_query_log(app_handle_ref, "查询结果为空");
@@ -389,7 +386,6 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
             columns: vec![],
             rows: vec![],
             total_rows: 0,
-            csv_file_path: None,
         });
     }
     
@@ -402,7 +398,6 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
         columns,
         rows: results,
         total_rows,
-        csv_file_path,
     })
 }
 
@@ -434,8 +429,8 @@ async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHa
     
     add_query_log(app_handle_ref, "执行SQL查询...");
     
-    // 执行查询，获取结果、列名和CSV文件路径
-    let (results, columns, csv_file_path) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
+    // 执行查询，获取结果和列名
+    let (results, columns) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
     
     if results.is_empty() {
         add_query_log(app_handle_ref, "查询结果为空");
@@ -443,7 +438,6 @@ async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHa
             columns: vec![],
             rows: vec![],
             total_rows: 0,
-            csv_file_path: None,
         });
     }
     
@@ -455,7 +449,6 @@ async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHa
         columns,
         rows: results,
         total_rows,
-        csv_file_path,
     })
 }
 
@@ -759,9 +752,6 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
         }
     });
     
-    // 数据已在内存中，不需要生成CSV文件（导出时从内存数据生成）
-    let csv_file_path = None;
-    
     let total_rows = result_rows.len();
     add_query_log(app_handle_ref, &format!("宽表查询完成，共 {} 行，{} 列", total_rows, columns.len()));
     
@@ -769,6 +759,5 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
         columns,
         rows: result_rows,
         total_rows,
-        csv_file_path,
     })
 }

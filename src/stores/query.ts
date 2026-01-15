@@ -33,7 +33,6 @@ export interface QueryResult {
   columns: string[];
   rows: Record<string, any>[];
   totalRows: number;
-  csvFilePath?: string; // 解压后的CSV文件路径，供导出时直接使用
 }
 
 export const useQueryStore = defineStore("query", {
