@@ -2,6 +2,7 @@ use crate::ssh::SshClient;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use tauri::AppHandle;
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -587,20 +588,34 @@ WantedBy=multi-user.target"#,
         add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  可执行文件: {}/bin/{}", INSTALL_DIR, BINARY_NAME));
         add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  配置文件: {}/config.toml", INSTALL_DIR));
         
-        let temp_service = "/tmp/analysis-collector.service";
-        match std::fs::write(temp_service, &service_content) {
-            Ok(_) => {
-                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 临时服务文件已创建: {}", temp_service));
-            }
+        // 使用 tempfile 创建跨平台临时文件
+        let temp_service_file = match NamedTempFile::new() {
+            Ok(f) => f,
             Err(e) => {
                 let err_msg = format!("创建临时服务文件失败: {}", e);
                 add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
                 return Err(err_msg);
             }
+        };
+        
+        let temp_service_path = temp_service_file.path().to_string_lossy().to_string();
+        
+        match std::fs::write(&temp_service_path, &service_content) {
+            Ok(_) => {
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 临时服务文件已创建: {}", temp_service_path));
+            }
+            Err(e) => {
+                let err_msg = format!("写入临时服务文件失败: {}", e);
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                return Err(err_msg);
+            }
         }
         
+        // 远程临时文件路径
+        let temp_remote = "/tmp/analysis-collector.service";
+        
         add_log_and_emit(app_handle.as_ref(), &mut logs, "上传服务文件...");
-        match SshClient::upload_file(temp_service, temp_service).await {
+        match SshClient::upload_file(&temp_service_path, temp_remote).await {
             Ok(_) => {
                 add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务文件上传成功");
             }
@@ -614,7 +629,7 @@ WantedBy=multi-user.target"#,
         add_log_and_emit(app_handle.as_ref(), &mut logs, "部署服务文件并重新加载 systemd...");
         let move_service_cmd = format!(
             "sudo mv '{}' '{}' && sudo systemctl daemon-reload",
-            temp_service, SERVICE_FILE
+            temp_remote, SERVICE_FILE
         );
         match SshClient::execute_command(&move_service_cmd).await {
             Ok((exit_status, stdout, stderr)) => {
