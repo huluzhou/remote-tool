@@ -1,6 +1,6 @@
 <template>
   <div class="query-form">
-    <h3>查询配置</h3>
+    <h3>导出宽表数据</h3>
     <form @submit.prevent="handleSubmit">
       <div class="form-group">
         <label>数据库路径:</label>
@@ -9,43 +9,6 @@
           type="text"
           placeholder="/mnt/analysis/data/device_data.db"
           required
-        />
-      </div>
-      <div class="form-group">
-        <label>查询类型:</label>
-        <div class="radio-group">
-          <label>
-            <input
-              v-model="formData.queryType"
-              type="radio"
-              value="device"
-            />
-            设备数据
-          </label>
-          <label>
-            <input
-              v-model="formData.queryType"
-              type="radio"
-              value="command"
-            />
-            指令数据
-          </label>
-          <label>
-            <input
-              v-model="formData.queryType"
-              type="radio"
-              value="wide_table"
-            />
-            宽表
-          </label>
-        </div>
-      </div>
-      <div v-if="formData.queryType !== 'wide_table'" class="form-group">
-        <label>设备序列号:</label>
-        <input
-          v-model="formData.deviceSn"
-          type="text"
-          placeholder="可选"
         />
       </div>
       <div class="form-group">
@@ -76,20 +39,8 @@
           <button type="button" @click="setEndTimeNow">现在</button>
         </div>
       </div>
-      <div
-        v-if="formData.queryType !== 'command'"
-        class="form-group"
-      >
-        <label>
-          <input
-            v-model="formData.includeExt"
-            type="checkbox"
-          />
-          包含扩展表数据
-        </label>
-      </div>
       <button type="submit" class="submit-btn" :disabled="loading">
-        {{ loading ? "查询中..." : "执行查询" }}
+        {{ loading ? "导出中..." : "导出CSV" }}
       </button>
     </form>
   </div>
@@ -108,9 +59,6 @@ const loading = computed(() => queryStore.loading);
 
 const formData = ref({
   dbPath: "/mnt/analysis/data/device_data.db",
-  queryType: "wide_table" as "device" | "command" | "wide_table",
-  deviceSn: "",
-  includeExt: true,
 });
 
 const startTimeInput = ref("");
@@ -182,11 +130,8 @@ const handleSubmit = () => {
 
   const params = {
     dbPath: formData.value.dbPath,
-    queryType: formData.value.queryType,
     startTime,
     endTime,
-    deviceSn: formData.value.deviceSn || undefined,
-    includeExt: formData.value.includeExt,
   };
 
   emit("query", params);

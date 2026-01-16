@@ -24,9 +24,13 @@ export interface QueryParams {
   dbPath: string;
   startTime: number;
   endTime: number;
-  deviceSn?: string;
-  includeExt?: boolean;
-  queryType: "device" | "command" | "wide_table";
+}
+
+export interface ExportWideTableParams {
+  dbPath: string;
+  startTime: number;
+  endTime: number;
+  outputPath: string;
 }
 
 export interface QueryResult {
@@ -43,10 +47,57 @@ export const useQueryStore = defineStore("query", {
     progress: 0,
     progressMessage: "",
     logs: [] as string[],
-    queryType: null as "device" | "command" | "wide_table" | null,
+    exportedRows: 0,
+    exportedPath: null as string | null,
   }),
 
   actions: {
+    async exportWideTable(params: ExportWideTableParams): Promise<void> {
+      this.loading = true;
+      this.error = null;
+      this.progress = 0;
+      this.progressMessage = "准备导出...";
+      this.logs = [];
+      this.exportedRows = 0;
+      this.exportedPath = null;
+      this.addLog("开始导出宽表数据...");
+      this.addLog(`数据库路径: ${params.dbPath}`);
+      // 使用 GMT+8 时区格式化时间范围
+      this.addLog(`时间范围: ${formatGMT8Time(params.startTime * 1000)} - ${formatGMT8Time(params.endTime * 1000)}`);
+      this.addLog(`输出路径: ${params.outputPath}`);
+
+      // 监听实时日志事件
+      const unlisten = await listen<string>("query-log", (event) => {
+        // 后端已经包含了时间戳，直接添加
+        this.logs.push(event.payload);
+      });
+
+      try {
+        this.addLog("正在连接数据库...");
+        this.updateProgress(10, "正在连接数据库...");
+        
+        this.addLog("正在执行SQL查询并压缩数据...");
+        this.updateProgress(30, "正在执行SQL查询并压缩数据...");
+        
+        const rowCount = await invoke<number>("export_wide_table_direct", { params });
+        
+        this.exportedRows = rowCount;
+        this.exportedPath = params.outputPath;
+        this.progress = 100;
+        this.progressMessage = `导出完成 (${rowCount} 条记录)`;
+        this.addLog(`导出成功！共导出 ${rowCount} 条记录到 ${params.outputPath}`);
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.error = errorMsg;
+        this.progressMessage = "导出失败";
+        this.addLog(`导出失败: ${errorMsg}`);
+      } finally {
+        // 取消事件监听
+        unlisten();
+        this.loading = false;
+      }
+    },
+
     async executeQuery(params: QueryParams): Promise<void> {
       this.loading = true;
       this.error = null;
@@ -54,7 +105,6 @@ export const useQueryStore = defineStore("query", {
       this.progressMessage = "正在连接...";
       this.logs = [];
       this.addLog("开始执行查询...");
-      this.addLog(`查询类型: ${params.queryType}`);
       this.addLog(`数据库路径: ${params.dbPath}`);
       // 使用 GMT+8 时区格式化时间范围
       this.addLog(`时间范围: ${formatGMT8Time(params.startTime * 1000)} - ${formatGMT8Time(params.endTime * 1000)}`);
@@ -72,11 +122,17 @@ export const useQueryStore = defineStore("query", {
         this.addLog("正在执行SQL查询...");
         this.updateProgress(30, "正在执行SQL查询...");
         
-        const result = await invoke<QueryResult>("execute_query", { params });
+        const result = await invoke<QueryResult>("execute_query", { 
+          params: {
+            ...params,
+            queryType: "wide_table",
+            deviceSn: undefined,
+            includeExt: false,
+          }
+        });
         
         this.addLog(`查询成功！共找到 ${result.totalRows} 条记录`);
         this.results = result;
-        this.queryType = params.queryType; // 保存查询类型
         this.progress = 100;
         this.progressMessage = `查询完成 (${result.totalRows} 条记录)`;
         this.addLog("查询完成");
@@ -109,7 +165,8 @@ export const useQueryStore = defineStore("query", {
       this.progress = 0;
       this.progressMessage = "";
       this.logs = [];
-      this.queryType = null;
+      this.exportedRows = 0;
+      this.exportedPath = null;
     },
   },
 });

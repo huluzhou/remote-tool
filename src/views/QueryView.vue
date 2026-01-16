@@ -3,7 +3,7 @@
     <SshConnection />
     <div v-if="sshStore.isConnected" class="query-container">
       <QueryForm @query="handleQuery" />
-      <div v-if="queryStore.loading || queryStore.results || queryStore.logs.length > 0" class="results-section">
+      <div v-if="queryStore.loading || queryStore.logs.length > 0 || queryStore.exportedPath || queryStore.error" class="results-section">
         <!-- 查询日志区域 -->
         <div v-if="queryStore.loading || queryStore.logs.length > 0" class="query-logs">
           <h4>查询日志</h4>
@@ -33,18 +33,19 @@
           <p>{{ queryStore.progressMessage }}</p>
         </div>
         
-        <!-- 查询结果 -->
-        <QueryResults
-          v-if="queryStore.results"
-          :results="queryStore.results"
-          @export="handleExport"
-        />
+        <!-- 导出结果信息 -->
+        <div v-if="!queryStore.loading && queryStore.exportedPath" class="export-result">
+          <div class="success-message">
+            <p>✓ 导出成功！</p>
+            <p>共导出 {{ queryStore.exportedRows }} 条记录</p>
+            <p class="file-path">文件路径: {{ queryStore.exportedPath }}</p>
+          </div>
+        </div>
         
-        <!-- 导出按钮（即使结果为空也显示） -->
-        <div v-if="!queryStore.loading && queryStore.results && queryStore.results.totalRows === 0" class="export-section">
+        <!-- 导出失败或无数据 -->
+        <div v-if="!queryStore.loading && !queryStore.exportedPath && queryStore.exportedRows === 0 && !queryStore.error" class="export-section">
           <div class="no-results-message">
-            <p>查询完成，但没有找到匹配的记录</p>
-            <button @click="handleExportFromStore" class="export-btn">导出为CSV</button>
+            <p>导出完成，但没有找到匹配的记录</p>
           </div>
         </div>
         
@@ -66,10 +67,7 @@ import { useSshStore } from "../stores/ssh";
 import { useQueryStore } from "../stores/query";
 import SshConnection from "../components/SshConnection.vue";
 import QueryForm from "../components/DataQuery/QueryForm.vue";
-import QueryResults from "../components/DataQuery/QueryResults.vue";
-import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { message } from "@tauri-apps/plugin-dialog";
 
 const sshStore = useSshStore();
 const queryStore = useQueryStore();
@@ -90,66 +88,37 @@ watch(() => queryStore.logs, () => {
 }, { deep: true });
 
 const handleQuery = async (params: any) => {
-  await queryStore.executeQuery(params);
-};
-
-const handleExport = async (data: any) => {
+  // 先弹出文件保存对话框
+  let filePath: string | null = null;
   try {
-    // 检查是否有数据
-    if (!data || !data.rows || data.rows.length === 0) {
-      await message("没有可导出的数据", {
-        title: "错误",
-        kind: "error",
-      });
-      return;
-    }
-
-    const filePath = await save({
+    filePath = await save({
       filters: [
         {
           name: "CSV",
           extensions: ["csv"],
         },
       ],
-      defaultPath: `query_result_${Date.now()}.csv`,
+      defaultPath: `wide_table_${Date.now()}.csv`,
     });
-
-    if (filePath) {
-      await invoke("export_to_csv", { 
-        data: {
-          columns: data.columns,
-          rows: data.rows,
-          totalRows: data.totalRows,
-        },
-        filePath,
-        queryType: queryStore.queryType 
-      });
-      await message("导出成功", {
-        title: "成功",
-        kind: "info",
-      });
-    }
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error("导出失败:", error);
-    await message(`导出失败: ${errorMsg}`, {
-      title: "错误",
-      kind: "error",
-    });
-  }
-};
-
-const handleExportFromStore = async () => {
-  if (!queryStore.results) {
-    await message("没有可导出的数据", {
-      title: "提示",
-      kind: "warning",
-    });
+    console.error("保存对话框失败:", error);
     return;
   }
-  
-  await handleExport(queryStore.results);
+
+  if (!filePath) {
+    // 用户取消了保存对话框
+    return;
+  }
+
+  // 调用导出函数
+  await queryStore.exportWideTable({
+    dbPath: params.dbPath,
+    startTime: params.startTime,
+    endTime: params.endTime,
+    outputPath: filePath,
+  });
 };
+
 </script>
 
 <style scoped>
@@ -281,18 +250,33 @@ const handleExportFromStore = async () => {
   color: rgba(255, 255, 255, 0.7);
 }
 
-.export-btn {
-  padding: 0.5rem 1rem;
-  background-color: #4caf50;
-  color: white;
-  font-size: 0.875rem;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background-color 0.2s;
+.export-result {
+  padding: 1rem;
+  background-color: rgba(76, 175, 80, 0.1);
+  border-radius: 8px;
+  border: 1px solid rgba(76, 175, 80, 0.3);
 }
 
-.export-btn:hover {
-  background-color: #45a049;
+.success-message {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.success-message p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.success-message p:first-child {
+  font-weight: 600;
+  color: #4caf50;
+  font-size: 1.1rem;
+}
+
+.file-path {
+  font-size: 0.875rem;
+  color: rgba(255, 255, 255, 0.7);
+  word-break: break-all;
 }
 </style>

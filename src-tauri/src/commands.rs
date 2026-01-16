@@ -60,6 +60,29 @@ pub async fn export_to_csv(
     export::export_to_csv(query_result, file_path, query_type).await
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportWideTableParams {
+    pub db_path: String,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub output_path: String,
+}
+
+#[tauri::command]
+pub async fn export_wide_table_direct(
+    app: tauri::AppHandle,
+    params: ExportWideTableParams,
+) -> Result<usize, String> {
+    crate::query::export_wide_table_direct(
+        params.db_path,
+        params.start_time,
+        params.end_time,
+        params.output_path,
+        Some(app),
+    ).await
+}
+
 #[tauri::command]
 pub async fn check_deploy_status() -> Result<DeployStatus, String> {
     crate::deploy::check_deploy_status().await
