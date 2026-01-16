@@ -92,8 +92,6 @@ export const useQueryStore = defineStore("query", {
           params: {
             ...params,
             queryType: "wide_table",
-            deviceSn: undefined,
-            includeExt: false,
           }
         });
         
