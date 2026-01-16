@@ -2,23 +2,7 @@ import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-// 格式化时间为 GMT+8 时区
-function formatGMT8Time(timestamp: number): string {
-  const date = new Date(timestamp);
-  // 获取 UTC 时间并加上 8 小时
-  const utcTime = date.getTime() + date.getTimezoneOffset() * 60 * 1000;
-  const beijingTime = new Date(utcTime + 8 * 60 * 60 * 1000);
-  return beijingTime.toISOString().slice(0, 19).replace('T', ' ');
-}
-
-// 格式化时间为 GMT+8 时区（仅时间部分）
-function formatGMT8TimeOnly(timestamp: number): string {
-  const date = new Date(timestamp);
-  // 获取 UTC 时间并加上 8 小时
-  const utcTime = date.getTime() + date.getTimezoneOffset() * 60 * 1000;
-  const beijingTime = new Date(utcTime + 8 * 60 * 60 * 1000);
-  return beijingTime.toISOString().slice(11, 19);
-}
+// 注意：时间格式化已由后端统一处理，前端不再需要格式化函数
 
 export interface QueryParams {
   dbPath: string;
@@ -60,24 +44,15 @@ export const useQueryStore = defineStore("query", {
       this.logs = [];
       this.exportedRows = 0;
       this.exportedPath = null;
-      this.addLog("开始导出宽表数据...");
-      this.addLog(`数据库路径: ${params.dbPath}`);
-      // 使用 GMT+8 时区格式化时间范围
-      this.addLog(`时间范围: ${formatGMT8Time(params.startTime * 1000)} - ${formatGMT8Time(params.endTime * 1000)}`);
-      this.addLog(`输出路径: ${params.outputPath}`);
 
-      // 监听实时日志事件
+      // 监听实时日志事件（后端已经包含了时间戳和格式化的日志）
       const unlisten = await listen<string>("query-log", (event) => {
         // 后端已经包含了时间戳，直接添加
         this.logs.push(event.payload);
       });
 
       try {
-        this.addLog("正在连接数据库...");
-        this.updateProgress(10, "正在连接数据库...");
-        
-        this.addLog("正在执行SQL查询并压缩数据...");
-        this.updateProgress(30, "正在执行SQL查询并压缩数据...");
+        this.updateProgress(10, "开始导出...");
         
         const rowCount = await invoke<number>("export_wide_table_direct", { params });
         
@@ -85,12 +60,11 @@ export const useQueryStore = defineStore("query", {
         this.exportedPath = params.outputPath;
         this.progress = 100;
         this.progressMessage = `导出完成 (${rowCount} 条记录)`;
-        this.addLog(`导出成功！共导出 ${rowCount} 条记录到 ${params.outputPath}`);
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         this.error = errorMsg;
         this.progressMessage = "导出失败";
-        this.addLog(`导出失败: ${errorMsg}`);
+        // 错误信息通过后端日志事件已经发送，这里只更新UI状态
       } finally {
         // 取消事件监听
         unlisten();
@@ -104,23 +78,15 @@ export const useQueryStore = defineStore("query", {
       this.progress = 0;
       this.progressMessage = "正在连接...";
       this.logs = [];
-      this.addLog("开始执行查询...");
-      this.addLog(`数据库路径: ${params.dbPath}`);
-      // 使用 GMT+8 时区格式化时间范围
-      this.addLog(`时间范围: ${formatGMT8Time(params.startTime * 1000)} - ${formatGMT8Time(params.endTime * 1000)}`);
 
-      // 监听实时日志事件
+      // 监听实时日志事件（后端已经包含了时间戳和格式化的日志）
       const unlisten = await listen<string>("query-log", (event) => {
         // 后端已经包含了时间戳，直接添加
         this.logs.push(event.payload);
       });
 
       try {
-        this.addLog("正在连接数据库...");
-        this.updateProgress(10, "正在连接数据库...");
-        
-        this.addLog("正在执行SQL查询...");
-        this.updateProgress(30, "正在执行SQL查询...");
+        this.updateProgress(10, "开始查询...");
         
         const result = await invoke<QueryResult>("execute_query", { 
           params: {
@@ -131,16 +97,14 @@ export const useQueryStore = defineStore("query", {
           }
         });
         
-        this.addLog(`查询成功！共找到 ${result.totalRows} 条记录`);
         this.results = result;
         this.progress = 100;
         this.progressMessage = `查询完成 (${result.totalRows} 条记录)`;
-        this.addLog("查询完成");
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         this.error = errorMsg;
         this.progressMessage = "查询失败";
-        this.addLog(`查询失败: ${errorMsg}`);
+        // 错误信息通过后端日志事件已经发送，这里只更新UI状态
       } finally {
         // 取消事件监听
         unlisten();
@@ -151,12 +115,6 @@ export const useQueryStore = defineStore("query", {
     updateProgress(progress: number, message: string) {
       this.progress = progress;
       this.progressMessage = message;
-    },
-
-    addLog(message: string) {
-      // 使用 GMT+8 时区格式化时间
-      const timestamp = formatGMT8TimeOnly(Date.now());
-      this.logs.push(`[${timestamp}] ${message}`);
     },
 
     clearResults() {

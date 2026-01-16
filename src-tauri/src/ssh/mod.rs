@@ -15,8 +15,34 @@ pub struct SshClient;
 
 static SSH_CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 static SSH_CONFIG: Mutex<Option<SshConfig>> = Mutex::new(None);
+// 日志回调函数：用于将SSH日志发送到查询日志
+static LOG_CALLBACK: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>> = Mutex::new(None);
 
 impl SshClient {
+    /// 设置日志回调函数（用于将SSH日志发送到查询日志）
+    pub fn set_log_callback<F>(callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        *LOG_CALLBACK.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    /// 清除日志回调函数
+    pub fn clear_log_callback() {
+        *LOG_CALLBACK.lock().unwrap() = None;
+    }
+
+    /// 发送日志（如果设置了回调函数，则调用回调；否则只输出到控制台）
+    fn log(message: &str) {
+        // 如果设置了回调函数，调用它（回调函数会负责发送到前端和控制台）
+        if let Some(callback) = LOG_CALLBACK.lock().unwrap().as_ref() {
+            callback(message);
+        } else {
+            // 如果没有设置回调，只输出到控制台
+            eprintln!("{}", message);
+        }
+    }
+
     /// 连接到 SSH 服务器（类似 paramiko 的连接方式，针对 JumpServer 优化）
     pub async fn connect(config: SshConfig) -> Result<()> {
         let addr = (&config.host[..], config.port);
@@ -111,7 +137,7 @@ impl SshClient {
         } else {
             command.to_string()
         };
-        eprintln!("[SSH] 开始执行命令 (长度: {}): {}", command.len(), cmd_preview);
+        Self::log(&format!("[SSH] 开始执行命令 (长度: {}): {}", command.len(), cmd_preview));
         
         // 执行命令（async-ssh2-tokio 提供了便捷的 execute 方法）
         let result = client
@@ -121,7 +147,7 @@ impl SshClient {
         
         // 记录执行耗时
         let elapsed = start_time.elapsed();
-        eprintln!("[SSH] 命令执行完成，耗时: {:.2}秒，退出码: {}", elapsed.as_secs_f64(), result.exit_status);
+        Self::log(&format!("[SSH] 命令执行完成，耗时: {:.2}秒，退出码: {}", elapsed.as_secs_f64(), result.exit_status));
         
         Ok((
             result.exit_status as i32,
@@ -151,7 +177,7 @@ impl SshClient {
         
         // 记录下载开始时间
         let start_time = std::time::Instant::now();
-        eprintln!("[SFTP] 开始下载文件: {} -> {}", remote_path, local_path);
+        Self::log(&format!("[SFTP] 开始下载文件: {} -> {}", remote_path, local_path));
         
         // 添加超时机制（60分钟，对于大文件足够）
         let download_future = client.download_file(remote_path, local_path);
@@ -159,7 +185,7 @@ impl SshClient {
             Ok(Ok(_)) => {
                 // 记录下载耗时
                 let elapsed = start_time.elapsed();
-                eprintln!("[SFTP] 文件下载完成，耗时: {:.2}秒", elapsed.as_secs_f64());
+                Self::log(&format!("[SFTP] 文件下载完成，耗时: {:.2}秒", elapsed.as_secs_f64()));
                 Ok(())
             }
             Ok(Err(e)) => {

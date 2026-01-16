@@ -59,15 +59,13 @@ pub async fn execute_query(
 ) -> Result<QueryResult, String> {
     let app_handle_ref = app_handle.as_ref();
     
-    // 记录查询开始信息
-    add_query_log(app_handle_ref, "开始执行查询...");
-    add_query_log(app_handle_ref, &format!("查询类型: {}", params.query_type));
-    add_query_log(app_handle_ref, &format!("数据库路径: {}", params.db_path));
-    
     // 使用GMT+8时区格式化时间范围
     let start_time_str = format_gmt8_time(params.start_time);
     let end_time_str = format_gmt8_time(params.end_time);
-    add_query_log(app_handle_ref, &format!("时间范围: {} - {}", start_time_str, end_time_str));
+    
+    // 合并查询开始信息为一条日志
+    add_query_log(app_handle_ref, &format!("开始查询 [{}] | 时间范围: {} - {}", 
+        params.query_type, start_time_str, end_time_str));
     
     match params.query_type.as_str() {
         "device" => {
@@ -96,14 +94,31 @@ pub async fn export_wide_table_direct(
 ) -> Result<usize, String> {
     let app_handle_ref = app_handle.as_ref();
     
-    // 记录导出开始信息
-    add_query_log(app_handle_ref, "开始导出宽表数据...");
-    add_query_log(app_handle_ref, &format!("数据库路径: {}", db_path));
+    // 设置SSH日志回调，将SSH日志发送到查询日志
+    if let Some(handle) = app_handle_ref {
+        let handle_clone = handle.clone();
+        crate::ssh::SshClient::set_log_callback(move |message: &str| {
+            // 添加时间戳并发送到查询日志
+            let beijing_tz = FixedOffset::east_opt(8 * 3600).unwrap();
+            let now = Utc::now().with_timezone(&beijing_tz);
+            let log_message = format!("[{}] {}", now.format("%H:%M:%S"), message);
+            
+            // 发送到前端
+            use tauri::Emitter;
+            let _ = handle_clone.emit("query-log", &log_message);
+            
+            // 同时输出到控制台
+            eprintln!("{}", log_message);
+        });
+    }
     
     // 使用GMT+8时区格式化时间范围
     let start_time_str = format_gmt8_time(start_time);
     let end_time_str = format_gmt8_time(end_time);
-    add_query_log(app_handle_ref, &format!("时间范围: {} - {}", start_time_str, end_time_str));
+    
+    // 合并导出开始信息为一条日志
+    add_query_log(app_handle_ref, &format!("开始导出宽表数据 | 时间范围: {} - {} | 输出: {}", 
+        start_time_str, end_time_str, output_path));
     
     // 将参数进行base64编码，避免shell注入
     let db_path_b64 = general_purpose::STANDARD.encode(db_path.as_bytes());
@@ -228,7 +243,7 @@ except Exception as e:
     sys.exit(1)
 "#, db_path_b64, temp_file, start_time, end_time);
     
-    add_query_log(app_handle_ref, "执行SQL查询并压缩数据...");
+    add_query_log(app_handle_ref, "执行查询并压缩数据...");
     
     // 使用heredoc方式执行Python脚本
     let mut eof_uuid_buffer = [0u8; 32];
@@ -243,7 +258,7 @@ except Exception as e:
     
     // 如果python3不存在，尝试python
     let (exit_status, stdout, stderr) = if exit_status != 0 && stderr.to_lowercase().contains("command not found") {
-        add_query_log(app_handle_ref, "python3 未找到，尝试使用 python");
+        add_query_log(app_handle_ref, "使用 python 替代 python3");
         let command = format!("python << '{}'\n{}\n{}", eof_marker, python_script, eof_marker);
         SshClient::execute_command(&command)
             .await
@@ -273,15 +288,13 @@ except Exception as e:
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     
-    add_query_log(app_handle_ref, &format!("远程临时文件: {} ({} 行)", remote_temp_file, row_count));
-    
     // 创建本地临时文件（用于下载压缩文件）
     let local_temp_file = NamedTempFile::new()
         .map_err(|e| format!("创建本地临时文件失败: {}", e))?;
     let local_temp_path = local_temp_file.path().to_string_lossy().to_string();
     
     // 使用SFTP下载文件
-    add_query_log(app_handle_ref, "下载压缩文件...");
+    add_query_log(app_handle_ref, "下载文件...");
     SshClient::download_file(remote_temp_file, &local_temp_path)
         .await
         .map_err(|e| format!("下载结果文件失败: {}", e))?;
@@ -290,13 +303,11 @@ except Exception as e:
     let compressed_size = std::fs::metadata(&local_temp_path)
         .map_err(|e| format!("获取文件信息失败: {}", e))?
         .len();
-    add_query_log(app_handle_ref, &format!("压缩文件下载成功: {} 字节 ({:.2} MB)", compressed_size, compressed_size as f64 / 1024.0 / 1024.0));
     
     // 清理远程临时文件
     let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
     
     // 流式解压并直接写入目标CSV文件（不加载到内存）
-    add_query_log(app_handle_ref, "解压并保存CSV文件...");
     {
         use std::io::{Read, Write};
         
@@ -337,8 +348,15 @@ except Exception as e:
     let final_size = std::fs::metadata(&output_path)
         .map_err(|e| format!("获取输出文件信息失败: {}", e))?
         .len();
-    add_query_log(app_handle_ref, &format!("CSV文件保存成功: {} 字节 ({:.2} MB)", final_size, final_size as f64 / 1024.0 / 1024.0));
-    add_query_log(app_handle_ref, &format!("导出完成，共 {} 条记录", row_count));
+    
+    // 合并最终信息为一条日志
+    add_query_log(app_handle_ref, &format!("导出完成 | {} 条记录 | 压缩: {:.2}MB | 解压: {:.2}MB", 
+        row_count, 
+        compressed_size as f64 / 1024.0 / 1024.0,
+        final_size as f64 / 1024.0 / 1024.0));
+    
+    // 清除SSH日志回调
+    crate::ssh::SshClient::clear_log_callback();
     
     Ok(row_count)
 }
@@ -347,6 +365,24 @@ except Exception as e:
 /// 返回 (结果数据, 列名列表)
 async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::AppHandle>) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
     let app_handle_ref = app_handle;
+    
+    // 设置SSH日志回调，将SSH日志发送到查询日志
+    if let Some(handle) = app_handle_ref {
+        let handle_clone = handle.clone();
+        crate::ssh::SshClient::set_log_callback(move |message: &str| {
+            // 添加时间戳并发送到查询日志
+            let beijing_tz = FixedOffset::east_opt(8 * 3600).unwrap();
+            let now = Utc::now().with_timezone(&beijing_tz);
+            let log_message = format!("[{}] {}", now.format("%H:%M:%S"), message);
+            
+            // 发送到前端
+            use tauri::Emitter;
+            let _ = handle_clone.emit("query-log", &log_message);
+            
+            // 同时输出到控制台
+            eprintln!("{}", log_message);
+        });
+    }
     
     // 将SQL和路径进行base64编码，避免shell注入
     let sql_b64 = general_purpose::STANDARD.encode(sql.as_bytes());
@@ -418,14 +454,11 @@ except Exception as e:
     print(error_msg, file=sys.stderr)
     sys.exit(1)
 "#, db_path_b64, sql_b64, temp_file);
-    println!("python_script: {}", python_script);
     // 使用heredoc方式执行Python脚本
     let mut eof_uuid_buffer = [0u8; 32];
     let eof_uuid_str = Uuid::new_v4().simple().encode_lower(&mut eof_uuid_buffer);
     let eof_marker = format!("PYTHON_SCRIPT_EOF_{}", &eof_uuid_str[..8]);
     let command = format!("python3 << '{}'\n{}\n{}", eof_marker, python_script, eof_marker);
-    
-    add_query_log(app_handle_ref, "执行SQL查询...");
     
     // 执行命令
     let (exit_status, stdout, stderr) = SshClient::execute_command(&command)
@@ -434,7 +467,7 @@ except Exception as e:
     
     // 如果python3不存在，尝试python
     let (exit_status, stdout, stderr) = if exit_status != 0 && stderr.to_lowercase().contains("command not found") {
-        add_query_log(app_handle_ref, "python3 未找到，尝试使用 python");
+        add_query_log(app_handle_ref, "使用 python 替代 python3");
         let command = format!("python << '{}'\n{}\n{}", eof_marker, python_script, eof_marker);
         SshClient::execute_command(&command)
             .await
@@ -456,7 +489,6 @@ except Exception as e:
     
     // 从stdout获取远程临时文件路径
     let remote_temp_file = stdout.trim();
-    add_query_log(app_handle_ref, &format!("远程临时文件: {}", remote_temp_file));
     
     // 创建本地临时文件（二进制模式，用于gzip文件）
     let local_temp_file = NamedTempFile::new()
@@ -464,7 +496,7 @@ except Exception as e:
     let local_temp_path = local_temp_file.path().to_string_lossy().to_string();
     
     // 使用SFTP下载文件
-    add_query_log(app_handle_ref, "下载查询结果文件...");
+    add_query_log(app_handle_ref, "下载查询结果...");
     SshClient::download_file(remote_temp_file, &local_temp_path)
         .await
         .map_err(|e| format!("下载结果文件失败: {}", e))?;
@@ -473,7 +505,6 @@ except Exception as e:
     let file_size = std::fs::metadata(&local_temp_path)
         .map_err(|e| format!("获取文件信息失败: {}", e))?
         .len();
-    add_query_log(app_handle_ref, &format!("文件下载成功: {} 字节 ({:.2} MB)", file_size, file_size as f64 / 1024.0 / 1024.0));
     
     // 清理远程临时文件
     let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
@@ -537,7 +568,11 @@ except Exception as e:
         results.push(serde_json::Value::Object(row));
     }
     
-    add_query_log(app_handle_ref, &format!("查询返回 {} 行", results.len()));
+    add_query_log(app_handle_ref, &format!("查询完成 | {} 行 | 文件大小: {:.2}MB", 
+        results.len(), file_size as f64 / 1024.0 / 1024.0));
+    
+    // 清除SSH日志回调
+    crate::ssh::SshClient::clear_log_callback();
     
     Ok((results, columns))
 }
@@ -565,8 +600,6 @@ async fn get_table_columns(db_path: &str, table_name: &str, app_handle: Option<&
 async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
     let app_handle_ref = app_handle.as_ref();
     
-    add_query_log(app_handle_ref, "开始查询设备数据...");
-    
     // 构建WHERE条件
     let mut conditions = vec![
         format!("d.timestamp >= {}", params.start_time),
@@ -577,13 +610,10 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
         // 转义单引号，防止SQL注入
         let escaped_device_sn = device_sn.replace("'", "''");
         conditions.push(format!("d.device_sn = '{}'", escaped_device_sn));
-        add_query_log(app_handle_ref, &format!("设备序列号: {}", device_sn));
     }
     
     let where_clause = conditions.join(" AND ");
     let include_ext = params.include_ext.unwrap_or(false);
-    
-    add_query_log(app_handle_ref, &format!("包含扩展表: {}", include_ext));
     
     // 构建SQL查询
     // 使用数据库中的实际列顺序，而不是硬编码的顺序
@@ -633,8 +663,6 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
         )
     };
     
-    add_query_log(app_handle_ref, "执行SQL查询...");
-    
     // 执行查询，获取结果和列名
     let (results, columns) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
     
@@ -650,7 +678,7 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
     // 使用从CSV headers中获取的列名（保持数据库中的顺序）
     let total_rows = results.len();
     
-    add_query_log(app_handle_ref, &format!("查询完成，共 {} 行，{} 列", total_rows, columns.len()));
+    add_query_log(app_handle_ref, &format!("设备数据查询完成 | {} 行 | {} 列", total_rows, columns.len()));
     
     Ok(QueryResult {
         columns,
@@ -662,8 +690,6 @@ async fn query_device_data(params: QueryParams, app_handle: Option<tauri::AppHan
 async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
     let app_handle_ref = app_handle.as_ref();
     
-    add_query_log(app_handle_ref, "开始查询命令数据...");
-    
     // 构建WHERE条件
     let mut conditions = vec![
         format!("timestamp >= {}", params.start_time),
@@ -674,7 +700,6 @@ async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHa
         // 转义单引号，防止SQL注入
         let escaped_device_sn = device_sn.replace("'", "''");
         conditions.push(format!("device_sn = '{}'", escaped_device_sn));
-        add_query_log(app_handle_ref, &format!("设备序列号: {}", device_sn));
     }
     
     let where_clause = conditions.join(" AND ");
@@ -684,8 +709,6 @@ async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHa
         "SELECT id, timestamp, device_sn, name, value, local_timestamp FROM cmd_data WHERE {} ORDER BY timestamp ASC",
         where_clause
     );
-    
-    add_query_log(app_handle_ref, "执行SQL查询...");
     
     // 执行查询，获取结果和列名
     let (results, columns) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
@@ -701,7 +724,7 @@ async fn query_command_data(params: QueryParams, app_handle: Option<tauri::AppHa
     
     let total_rows = results.len();
     
-    add_query_log(app_handle_ref, &format!("查询完成，共 {} 行，{} 列", total_rows, columns.len()));
+    add_query_log(app_handle_ref, &format!("命令数据查询完成 | {} 行 | {} 列", total_rows, columns.len()));
     
     Ok(QueryResult {
         columns,
@@ -782,8 +805,6 @@ fn parse_wide_table_config_file(path: &Path) -> Result<WideTableConfig, Box<dyn 
 async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
     let app_handle_ref = app_handle.as_ref();
     
-    add_query_log(app_handle_ref, "开始执行宽表查询...");
-    
     // 加载配置
     let config = load_wide_table_config();
     
@@ -798,10 +819,7 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
         .cloned()
         .collect();
     
-    add_query_log(app_handle_ref, &format!("主表数据字段: {:?}", main_table_fields));
-    
     // 1. 查询所有设备数据（不限制device_sn）
-    add_query_log(app_handle_ref, "查询所有设备数据...");
     let include_ext = params.include_ext.unwrap_or(false);
     
     let device_params = QueryParams {
@@ -814,10 +832,8 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
     };
     
     let device_result = query_device_data(device_params, app_handle.clone()).await?;
-    add_query_log(app_handle_ref, &format!("设备数据查询完成: {} 行", device_result.total_rows));
     
     // 2. 查询所有命令数据
-    add_query_log(app_handle_ref, "查询所有命令数据...");
     let command_params = QueryParams {
         db_path: params.db_path.clone(),
         start_time: params.start_time,
@@ -828,7 +844,6 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
     };
     
     let command_result = query_command_data(command_params, app_handle.clone()).await?;
-    add_query_log(app_handle_ref, &format!("命令数据查询完成: {} 行", command_result.total_rows));
     
     // 3. 在内存中合并数据，按 local_timestamp 分组
     add_query_log(app_handle_ref, "合并数据...");
@@ -986,8 +1001,6 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
             .unwrap_or(0)
     });
     
-    add_query_log(app_handle_ref, &format!("数据合并完成: {} 行", result_rows.len()));
-    
     // 提取所有列名（从所有行中收集）
     let mut all_columns: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in &result_rows {
@@ -1011,7 +1024,7 @@ async fn execute_wide_table_query(params: QueryParams, app_handle: Option<tauri:
     });
     
     let total_rows = result_rows.len();
-    add_query_log(app_handle_ref, &format!("宽表查询完成，共 {} 行，{} 列", total_rows, columns.len()));
+    add_query_log(app_handle_ref, &format!("宽表查询完成 | {} 行 | {} 列", total_rows, columns.len()));
     
     Ok(QueryResult {
         columns,
