@@ -1,6 +1,6 @@
 {
   "productName": "remote-tool",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.remote-tool.app",
   "build": {
     "beforeDevCommand": "npm run dev",

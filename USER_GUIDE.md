@@ -1,6 +1,8 @@
 # 数据库查询工具 - 用户使用教程
 
-本文档面向使用打包后的可执行文件的用户，介绍如何使用图形界面和配置文件。
+本文档面向使用打包后的可执行文件的用户，介绍如何使用图形界面进行数据查询和导出。
+
+> **注意**：本工具仅支持查询 `data_wide` 宽表，不再支持旧表（device_data、cmd_data）的查询。
 
 ## 目录
 
@@ -15,15 +17,16 @@
 
 ### 1. 启动程序
 
-1. 确保 `query_tool.exe` 和 `csv_export_config.toml` 在同一目录下
-2. 双击 `query_tool.exe` 启动程序
-3. 首次启动可能需要几秒钟，请耐心等待
+1. 双击 `remote-tool.exe`（或对应平台的安装包）启动程序
+2. 首次启动可能需要几秒钟，请耐心等待
 
 ### 2. 基本使用流程
 
 ```
-连接SSH → 配置查询 → 执行查询 → 查看结果 → 导出CSV
+连接SSH → 配置时间范围 → 执行查询/导出CSV → 查看结果
 ```
+
+> **说明**：本工具直接从 `data_wide` 宽表查询数据，无需额外配置。
 
 ---
 
@@ -73,21 +76,15 @@
 
 ### 三、查询配置
 
-#### 3.1 选择查询类型
+#### 3.1 数据库路径
 
-在 **"查询配置"** 区域顶部，选择查询类型：
+- **数据库路径**：输入远程服务器上的数据库文件路径
+  - 默认值：`/mnt/analysis/data/device_data.db`
+  - 根据实际情况修改为正确的路径
 
-- **设备数据**：查询设备运行数据~~（默认）~~
-- **指令数据**：查询设备控制指令数据
-- **宽表数据**：查询所有设备数据<mark>(默认)</mark>
+> **说明**：程序会自动从 `data_wide` 表查询所有设备数据和命令数据，无需选择查询类型。
 
-#### 3.2 设备序列号（<mark>必</mark>选）
-
-- 如果留空：查询所有设备的数据
-- 如果填写：只查询指定设备的数据
-  - 示例：`THBESS0000AHDVJ73VPD2` 等
-
-#### 3.3 设置时间范围
+#### 3.2 设置时间范围
 
 **开始时间**：
 
@@ -109,17 +106,24 @@
 - 日期：`2024-01-01`
 - 日期时间：`2024-01-01 12:00:00`
 
-#### 3.4 扩展表数据选项（仅设备数据查询）
+#### 3.3 执行查询或导出
 
-- **包含扩展表数据**（默认勾选）：
-  - 勾选：查询结果包含扩展字段（从 payload_json 中提取）
-  - 不勾选：只查询主表字段
+**两种模式**：
 
-#### 3.5 执行查询
+1. **查询模式**：
+   - 点击 **"执行查询"** 按钮
+   - 查询结果会显示在下方的 **"查询结果"** 区域
+   - 支持分页浏览（每页100条记录）
+   - 结果按 `local_timestamp` 从早到晚排序
 
-1. 配置完成后，点击 **"执行查询"** 按钮
-2. 查询结果会显示在下方的 **"查询结果"** 区域
-3. 如果查询失败，会弹出错误提示
+2. **导出模式**（推荐，支持大数据量）：
+   - 点击 **"导出CSV"** 按钮
+   - 在弹出的文件保存对话框中：
+     - 选择保存位置
+     - 输入文件名（默认：`wide_table_时间戳.csv`）
+     - 点击 **"保存"**
+   - 程序会使用流式处理导出数据，支持大数据量，不会占用大量内存
+   - 导出过程中会显示实时日志和进度
 
 ---
 
@@ -131,12 +135,14 @@
 
 - 使用滚动条查看完整结果
 - 支持横向和纵向滚动
-- 结果按时间从早到晚排序
+- 结果按 `local_timestamp` 从早到晚排序
+- 支持分页浏览（每页100条记录）
 
 #### 4.2 结果说明
 
-- **设备数据查询**：显示设备运行数据，包含主表字段和扩展字段
-- **指令数据查询**：显示设备控制指令数据
+- **宽表数据**：显示所有设备的数据和命令数据
+- **列名格式**：`{device_sn}_{field_name}`（例如：`METER001_activePower`）
+- **时间字段**：`local_timestamp` 为毫秒级时间戳
 
 ---
 
@@ -144,11 +150,10 @@
 
 #### 5.1 导出为CSV
 
-1. 执行查询后，**"导出为CSV"** 按钮会变为可用状态
-2. 点击 **"导出为CSV"** 按钮
-3. 在弹出的文件保存对话框中：
+1. 点击 **"导出CSV"** 按钮（无需先执行查询）
+2. 在弹出的文件保存对话框中：
    - 选择保存位置
-   - 输入文件名（默认：`query_result_YYYYMMDD_HHMMSS.csv`）
+   - 输入文件名（默认：`wide_table_时间戳.csv`）
    - 点击 **"保存"**
 
 #### 5.2 CSV文件说明
@@ -157,10 +162,9 @@
 
 - **编码格式**：UTF-8 with BOM（Excel可直接打开，不会乱码）
 - **时间格式**：
-  - `timestamp`：格式化为 `YYYY-MM-DD HH:MM:SS`（东八区）
-  - `local_timestamp`：格式化为 `YYYY/MM/DD H:MM:SS.000`（东八区，包含毫秒）
-- **字段过滤**：只包含主表字段和配置文件中指定的扩展字段
-- **不包含**：`payload_json` 列（原始JSON数据）
+  - `local_timestamp`：格式化为 `YYYY-MM-DD HH:MM:SS.mmm`（东八区，包含毫秒）
+- **列顺序**：`local_timestamp` 列在最前，其他列按字母顺序排列
+- **数据完整性**：包含 `data_wide` 表中的所有列
 
 #### 5.3 在Excel中打开
 
@@ -212,263 +216,26 @@
 
 * 文件路径：通过弹窗选择需要部署的可执行文件，每次修改会自动保存
 
---- 
-
-## 配置文件使用说明
-
-### 一、配置文件位置
-
-配置文件 `csv_export_config.toml` 必须与 `query_tool.exe` 放在同一目录下。
-
-```
-程序目录/
-├── query_tool.exe
-└── csv_export_config.toml  ← 配置文件
-```
-
-### 二、配置文件格式
-
-配置文件使用 TOML 格式，支持注释（以 `#` 开头）。
-
-### 三、配置项说明
-
-#### 3.1 主表字段（main_table_fields）
-
-**说明**：这些字段会始终出现在CSV中。
-
-**配置示例**：
-
-```toml
-main_table_fields = [
-    "id",
-    "device_sn",
-    "device_type",
-    "timestamp",
-    "local_timestamp",
-    "activePower",
-    "reactivePower",
-    "powerFactor"
-]
-```
-
-**修改方法**：
-
-- 添加字段：在列表中添加字段名（如：`"newField"`）
-- 删除字段：从列表中移除字段名
-- 调整顺序：改变列表中的顺序即可
-
-#### 3.2 扩展字段（extract_from_payload）
-
-**说明**：从 `payload_json` 中提取的字段，按设备类型分组配置。
-
-**配置结构**：
-
-```toml
-[extract_from_payload]
-# 电表设备类型
-METER = [
-    "activeEnergy",
-    "reverseActiveEnergy",
-    "ACfrequqncy",
-    "apparentPower"
-]
-
-# 储能设备类型
-STORAGE = [
-    "TotalChgE",
-    "TotalDisCE"
-]
-
-# 光伏设备类型
-PV = [
-    # "activePowerLimit",
-    # "internalTemp"
-]
-
-# 充电桩设备类型
-CHARGER = [
-    # "OutP",
-    # "needPower"
-]
-
-# 默认设备类型（未匹配到上述类型时使用）
-default = []
-```
-
-**修改方法**：
-
-1. **添加字段**：
-   
-   ```toml
-   STORAGE = [
-       "TotalChgE",
-       "TotalDisCE",
-       "SOC-BAT-001",  # 新增字段
-       "SOH-BAT-001"   # 新增字段
-   ]
-   ```
-
-2. **删除字段**：
-   
-   - 从列表中移除字段名
-   - 或使用注释（在字段名前加 `#`）
-
-3. **启用被注释的字段**：
-   
-   - 移除字段名前的 `#` 号
-
-4. **添加新的设备类型**：
-   
-   ```toml
-   [extract_from_payload]
-   NEW_DEVICE_TYPE = [
-       "field1",
-       "field2"
-   ]
-   ```
-
-#### 3.3 字段名映射（field_name_mapping）
-
-**说明**：将 `payload_json` 中的字段名映射为CSV中的列名。
-
-**配置示例**：
-
-```toml
-[field_name_mapping]
-"SOC-BAT-001" = "soc"
-"SOH-BAT-001" = "soh"
-"internalT-PCS-001" = "internalT"
-"radiatorT-PCS-001" = "radiatorT"
-"cellTotalChgE-BAT-001" = "totalChargeEnergy"
-"cellTotalDisCE-BAT-001" = "totalDischargeEnergy"
-```
-
-**使用场景**：
-
-- JSON中的字段名太长或不易读（如：`SOC-BAT-001`）
-- 希望CSV中的列名更简洁（如：`soc`）
-
-**修改方法**：
-
-1. **添加映射**：
-   
-   ```toml
-   [field_name_mapping]
-   "原始字段名" = "CSV列名"
-   ```
-
-2. **删除映射**：
-   
-   - 删除整行，或使用注释
-
-3. **修改映射**：
-   
-   - 修改等号右侧的值
-
-**注意事项**：
-
-- 左侧的字段名必须与 `extract_from_payload` 中配置的字段名一致
-- 右侧的列名会出现在CSV文件的表头中
-
 ---
 
-### 四、配置示例
+## 数据表说明
 
-#### 示例1：为储能设备添加更多字段
+### data_wide 宽表
 
-```toml
-[extract_from_payload]
-STORAGE = [
-    "TotalChgE",
-    "TotalDisCE",
-    "SOC-BAT-001",      # 新增：电池SOC
-    "SOH-BAT-001",      # 新增：电池SOH
-    "internalT-PCS-001", # 新增：内部温度
-    "radiatorT-PCS-001"  # 新增：散热器温度
-]
+本工具直接从 `data_wide` 表查询数据，该表包含：
 
-[field_name_mapping]
-"SOC-BAT-001" = "soc"
-"SOH-BAT-001" = "soh"
-"internalT-PCS-001" = "internalT"
-"radiatorT-PCS-001" = "radiatorT"
-```
+- **主键**：`local_timestamp`（毫秒级时间戳）
+- **动态列**：根据实际数据动态创建
+- **列名格式**：`{device_sn}_{field_name}`
+  - 设备数据列：例如 `METER001_activePower`、`STORAGE001_soc`
+  - 命令数据列：例如 `METER001_activePowerLimit`、`STORAGE001_chargeLimit`
 
-#### 示例2：只导出主表字段
+**特点**：
+- 所有设备的数据和命令数据在同一张表中
+- 同一时间点的数据在同一行，便于分析
+- 列根据配置和实际数据动态创建
 
-```toml
-[extract_from_payload]
-METER = []
-STORAGE = []
-PV = []
-CHARGER = []
-default = []
-```
-
-#### 示例3：为所有设备类型添加通用字段
-
-```toml
-[extract_from_payload]
-METER = ["activeEnergy"]
-STORAGE = ["TotalChgE", "TotalDisCE"]
-PV = ["dayActiveEnergy"]
-CHARGER = ["chargeEnergy"]
-default = ["commonField"]  # 未匹配设备类型时使用
-```
-
----
-
-### 五、配置文件修改步骤
-
-1. **关闭程序**（如果正在运行）
-
-2. **备份配置文件**（推荐）：
-   
-   ```
-   复制 csv_export_config.toml → csv_export_config.toml.bak
-   ```
-
-3. **使用文本编辑器打开** `csv_export_config.toml`
-   
-   - 推荐使用：Notepad++、VS Code、记事本等
-   - 确保使用UTF-8编码保存
-
-4. **修改配置**：
-   
-   - 按照上述说明修改相应配置项
-   - 注意保持TOML格式正确（括号、引号等）
-
-5. **保存文件**
-
-6. **重新启动程序**，配置立即生效
-
----
-
-### 六、配置文件验证
-
-#### 常见错误
-
-1. **语法错误**：
-   
-   - 缺少引号：`METER = [activeEnergy]` ❌
-   - 正确：`METER = ["activeEnergy"]` ✅
-
-2. **格式错误**：
-   
-   - 缺少等号：`METER ["field"]` ❌
-   - 正确：`METER = ["field"]` ✅
-
-3. **编码问题**：
-   
-   - 确保文件以UTF-8编码保存
-   - 避免使用Windows记事本（可能添加BOM）
-
-#### 验证方法
-
-1. 修改配置后，启动程序
-2. 执行一次查询并导出CSV
-3. 检查CSV文件中的列是否符合预期
-4. 如果列名或数据不正确，检查配置文件格式
+> **注意**：本工具不再支持旧表（device_data、cmd_data、device_data_ext）的查询。
 
 ---
 
@@ -478,13 +245,13 @@ default = ["commonField"]  # 未匹配设备类型时使用
 
 **可能原因**：
 
-- 缺少配置文件 `csv_export_config.toml`
 - 杀毒软件阻止运行
+- 系统依赖缺失
 
 **解决方法**：
 
-1. 确保 `csv_export_config.toml` 与 `query_tool.exe` 在同一目录
-2. 将程序目录添加到杀毒软件白名单
+1. 将程序目录添加到杀毒软件白名单
+2. 检查系统依赖是否完整
 
 ---
 
@@ -524,14 +291,14 @@ default = ["commonField"]  # 未匹配设备类型时使用
 
 **可能原因**：
 
-- 配置文件中未配置相应字段
-- 设备类型不匹配
+- `data_wide` 表中确实没有该字段
+- 该时间范围内没有该设备的数据
 
 **解决方法**：
 
-1. 检查 `csv_export_config.toml` 中是否配置了相应字段
-2. 确认设备类型是否正确（METER、STORAGE、PV、CHARGER）
-3. 查看查询结果中的 `device_type` 字段，确认设备类型
+1. 检查 `data_wide` 表结构，确认字段是否存在
+2. 扩大时间范围，确认是否有该设备的数据
+3. 列名格式为 `{device_sn}_{field_name}`，确认设备序列号是否正确
 
 ---
 
@@ -545,25 +312,28 @@ default = ["commonField"]  # 未匹配设备类型时使用
 
 ---
 
-### Q6: 修改配置文件后不生效
+### Q6: 查询或导出失败
+
+**可能原因**：
+
+- 数据库路径不正确
+- `data_wide` 表不存在
+- 时间范围设置错误
 
 **解决方法**：
 
-1. 确保文件保存为UTF-8编码
-2. 检查TOML格式是否正确
-3. 重新启动程序
-4. 检查配置文件是否与exe在同一目录
+1. 检查数据库路径是否正确
+2. 确认 `data_wide` 表存在
+3. 检查时间格式是否正确（时间戳或日期格式）
 
 ---
 
-### Q7: 时间戳格式不正确
+### Q7: 时间戳格式说明
 
 **说明**：
 
-- `timestamp`：格式为 `YYYY-MM-DD HH:MM:SS`（东八区）
-- `local_timestamp`：格式为 `YYYY/MM/DD H:MM:SS.000`（东八区，包含毫秒）
-
-如果格式不符合预期，这是正常现象，程序会自动格式化时间戳。
+- `local_timestamp`：在CSV中格式化为 `YYYY-MM-DD HH:MM:SS.mmm`（东八区，包含毫秒）
+- 程序会自动格式化时间戳，这是正常现象
 
 ---
 
@@ -571,9 +341,11 @@ default = ["commonField"]  # 未匹配设备类型时使用
 
 **方法**：
 
-1. 在查询配置中，取消勾选 **"包含扩展表数据"**
-2. 执行查询，查看结果中的字段
-3. 或者勾选 **"包含扩展表数据"**，查看 `payload_json` 中的字段（需要解析JSON）
+1. 执行查询，查看结果表格中的所有列
+2. 列名格式为 `{device_sn}_{field_name}`，例如：
+   - `METER001_activePower` - 电表METER001的有功功率
+   - `STORAGE001_soc` - 储能设备STORAGE001的SOC
+   - `METER001_activePowerLimit` - 电表METER001的有功功率限制命令
 
 ---
 
@@ -581,12 +353,12 @@ default = ["commonField"]  # 未匹配设备类型时使用
 
 如遇到其他问题，请：
 
-1. 检查配置文件格式是否正确
-2. 查看程序运行时的错误提示
+1. 检查数据库路径和表结构是否正确
+2. 查看程序运行时的错误提示和日志
 3. 联系技术支持并提供：
    - 错误信息截图
-   - 配置文件内容
    - 操作步骤
+   - 数据库路径和表结构信息
 
 ---
 
@@ -613,23 +385,19 @@ default = ["commonField"]  # 未匹配设备类型时使用
 
 ### CSV文件列说明
 
-**主表字段**（始终存在）：
+**固定字段**：
 
-- `id`：记录ID
-- `device_sn`：设备序列号
-- `device_type`：设备类型
-- `timestamp`：设备时间戳（格式化后）
-- `local_timestamp`：本地时间戳（格式化后，包含毫秒）
-- `activePower`：有功功率
-- `reactivePower`：无功功率
-- `powerFactor`：功率因数
+- `local_timestamp`：本地时间戳（格式化后，包含毫秒），始终在第一列
 
-**扩展字段**（根据配置文件提取）：
+**动态字段**（根据 data_wide 表结构）：
 
-- 从 `payload_json` 中提取的字段
-- 字段名可能经过映射（根据 `field_name_mapping` 配置）
+- 列名格式：`{device_sn}_{field_name}`
+- 设备数据列：例如 `METER001_activePower`、`STORAGE001_soc`
+- 命令数据列：例如 `METER001_activePowerLimit`、`STORAGE001_chargeLimit`
+- 列顺序：除 `local_timestamp` 外，其他列按字母顺序排列
 
 ---
 
-**文档版本**：1.1  
-**最后更新**：2025.1.8
+**文档版本**：2.0  
+**最后更新**：2025.1.8  
+**更新说明**：仅支持 data_wide 宽表查询，不再支持旧表查询和配置文件
