@@ -1,6 +1,6 @@
 {
   "productName": "remote-tool",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "identifier": "com.remote-tool.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -48,7 +48,7 @@
         "https://github.com/huluzhou/remote-tool/releases/latest/download/latest.json"
       ],
       "dialog": true,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU3NEFERTIyNUY5Nzk1MTUKUldRVmxaZGZJdDVLNTBmaGszYjArMkxLZFdBbTBDT0NocVJzcjNGYXhTMEQ5cWowcE1IbytlZnUK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhGRjlBNjlDMDVGNkREQzIKUldUQzNmWUZuS2I1ajdaV2JsRTFKQzR2cUtXeHhQSzBud0RrYXMyK1dzQ3pmbEpCbVo0VTM3NFoK"
     }
   }
 }
