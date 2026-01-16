@@ -1,0 +1,199 @@
+use async_ssh2_tokio::{Client, AuthMethod, ServerCheckMethod};
+use std::sync::{Arc, Mutex};
+use anyhow::{Result, Context};
+
+#[derive(Clone)]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: Option<String>,
+    pub key_file: Option<String>,
+}
+
+pub struct SshClient;
+
+static SSH_CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
+static SSH_CONFIG: Mutex<Option<SshConfig>> = Mutex::new(None);
+// 日志回调函数：用于将SSH日志发送到查询日志
+static LOG_CALLBACK: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>> = Mutex::new(None);
+
+impl SshClient {
+    /// 设置日志回调函数（用于将SSH日志发送到查询日志）
+    pub fn set_log_callback<F>(callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        *LOG_CALLBACK.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    /// 清除日志回调函数
+    pub fn clear_log_callback() {
+        *LOG_CALLBACK.lock().unwrap() = None;
+    }
+
+    /// 发送日志（如果设置了回调函数，则调用回调；否则只输出到控制台）
+    fn log(message: &str) {
+        // 如果设置了回调函数，调用它（回调函数会负责发送到前端和控制台）
+        if let Some(callback) = LOG_CALLBACK.lock().unwrap().as_ref() {
+            callback(message);
+        } else {
+            // 如果没有设置回调，只输出到控制台
+            eprintln!("{}", message);
+        }
+    }
+
+    /// 连接到 SSH 服务器（类似 paramiko 的连接方式，针对 JumpServer 优化）
+    pub async fn connect(config: SshConfig) -> Result<()> {
+        let addr = (&config.host[..], config.port);
+        
+        // 尝试使用密钥文件认证（类似 paramiko 的 key_filename）
+        // 注意：async-ssh2-tokio 默认只使用指定的认证方法，相当于 paramiko 的
+        // look_for_keys=False（不自动查找密钥）和 allow_agent=False（不使用 SSH 代理）
+        if let Some(ref key_file) = config.key_file {
+            if std::path::Path::new(key_file).exists() {
+                let auth = AuthMethod::with_key_file(key_file, None);
+                match Client::connect(
+                    addr,
+                    &config.username,
+                    auth,
+                    ServerCheckMethod::NoCheck, // 自动接受服务器密钥（类似 AutoAddPolicy）
+                )
+                    .await
+                {
+                    Ok(client) => {
+                        // 密钥认证成功
+                        let client_arc = Arc::new(client);
+                        *SSH_CLIENT.lock().unwrap() = Some(client_arc);
+                        *SSH_CONFIG.lock().unwrap() = Some(config);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("密钥认证失败: {}, 尝试密码认证", e);
+                        // 继续尝试密码
+                    }
+                }
+            }
+        }
+        
+        // 使用密码认证（类似 paramiko 的 password）
+        // 注意：AuthMethod::with_password() 只使用密码认证，不会尝试密钥或代理
+        // 这相当于 paramiko 的 look_for_keys=False 和 allow_agent=False（对 JumpServer 很重要）
+        if let Some(ref password) = config.password {
+            let auth = AuthMethod::with_password(password);
+            let client = Client::connect(
+                addr,
+                &config.username,
+                auth,
+                ServerCheckMethod::NoCheck, // 自动接受服务器密钥（类似 AutoAddPolicy）
+            )
+                .await
+            .with_context(|| format!("SSH 连接失败: {}@{}:{}", config.username, config.host, config.port))?;
+            
+                let client_arc = Arc::new(client);
+                *SSH_CLIENT.lock().unwrap() = Some(client_arc);
+            *SSH_CONFIG.lock().unwrap() = Some(config);
+                Ok(())
+        } else {
+            anyhow::bail!(
+                "缺少认证信息\n\n\
+                服务器: {}:{}\n\
+                用户名: {}\n\n\
+                请提供密码或密钥文件",
+                config.host, config.port, config.username
+            )
+        }
+    }
+
+    /// 断开 SSH 连接
+    pub async fn disconnect() {
+        if let Some(client) = SSH_CLIENT.lock().unwrap().take() {
+            // Client 在 Drop 时会自动关闭连接
+            drop(client);
+        }
+        *SSH_CONFIG.lock().unwrap() = None;
+    }
+
+    /// 获取 SSH 客户端
+    pub fn get_client() -> Result<Arc<Client>> {
+        SSH_CLIENT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("未连接，请先调用 connect()"))
+            .map(|c| c.clone())
+    }
+
+    /// 执行 SSH 命令（类似 paramiko 的 exec_command）
+    pub async fn execute_command(command: &str) -> Result<(i32, String, String)> {
+        let client = Self::get_client()?;
+        
+        // 记录命令执行开始时间
+        let start_time = std::time::Instant::now();
+        
+        // 截取命令的前100个字符用于日志（避免日志过长）
+        let cmd_preview = if command.len() > 100 {
+            format!("{}...", &command[..100])
+        } else {
+            command.to_string()
+        };
+        Self::log(&format!("[SSH] 开始执行命令 (长度: {}): {}", command.len(), cmd_preview));
+        
+        // 执行命令（async-ssh2-tokio 提供了便捷的 execute 方法）
+        let result = client
+            .execute(command)
+            .await
+            .with_context(|| format!("执行命令失败: {}", command))?;
+        
+        // 记录执行耗时
+        let elapsed = start_time.elapsed();
+        Self::log(&format!("[SSH] 命令执行完成，耗时: {:.2}秒，退出码: {}", elapsed.as_secs_f64(), result.exit_status));
+        
+        Ok((
+            result.exit_status as i32,
+            result.stdout,
+            result.stderr,
+        ))
+    }
+
+    /// 上传文件到远程服务器（使用 SFTP，类似 paramiko 的 put）
+    pub async fn upload_file(local_path: &str, remote_path: &str) -> Result<()> {
+        let client = Self::get_client()?;
+        
+        // upload_file(本地路径, 远程路径, 权限, 块大小, 是否覆盖)
+        client
+            .upload_file(local_path, remote_path, None, None, true)
+            .await
+            .with_context(|| format!("上传文件失败: {} -> {}", local_path, remote_path))?;
+        
+        Ok(())
+    }
+
+    /// 从远程服务器下载文件（使用 SFTP，类似 paramiko 的 get）
+    pub async fn download_file(remote_path: &str, local_path: &str) -> Result<()> {
+        use tokio::time::{timeout, Duration};
+        
+        let client = Self::get_client()?;
+        
+        // 记录下载开始时间
+        let start_time = std::time::Instant::now();
+        Self::log(&format!("[SFTP] 开始下载文件: {} -> {}", remote_path, local_path));
+        
+        // 添加超时机制（60分钟，对于大文件足够）
+        let download_future = client.download_file(remote_path, local_path);
+        match timeout(Duration::from_secs(60*60), download_future).await {
+            Ok(Ok(_)) => {
+                // 记录下载耗时
+                let elapsed = start_time.elapsed();
+                Self::log(&format!("[SFTP] 文件下载完成，耗时: {:.2}秒", elapsed.as_secs_f64()));
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                Err(e).with_context(|| format!("下载文件失败: {} -> {}", remote_path, local_path))
+            }
+            Err(_) => {
+                Err(anyhow::anyhow!("下载文件超时（超过60分钟）: {} -> {}", remote_path, local_path))
+            }
+        }
+    }
+}

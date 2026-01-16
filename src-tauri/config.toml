@@ -1,0 +1,95 @@
+# Analysis Collector 配置文件示例
+# 复制此文件为 config.toml 并根据需要修改
+
+# NNG 配置
+[nng]
+# 数据通道地址
+data_address = "ipc:///tmp/dev_model-to-analysis-data"
+# 命令通道地址
+cmd_address = "ipc:///tmp/dev_model-to-analysis-cmd"
+
+# 数据库配置
+[database]
+# 数据库文件路径（相对于工作目录或绝对路径）
+# 生产环境建议使用绝对路径：/opt/analysis/data/device_data.db
+path = "/mnt/analysis/data/device_data.db"
+
+[debug]
+# 是否启用调试模式（保存原始消息）
+enabled = false
+# 调试输出目录（相对于工作目录或绝对路径）
+# 生产环境建议使用绝对路径：/opt/analysis/debug_messages
+output_dir = "/mnt/analysis/debug_messages"
+# 原始消息文件最大数量，超过此数量将删除最旧的文件
+# 注意：每条原始消息保存为一个独立的 JSON 文件
+max_raw_files = 1000
+# 解析数据文件最大数量，超过此数量将删除最旧的文件
+max_parsed_files = 1000
+# 命令数据文件最大数量，超过此数量将删除最旧的文件
+max_command_files = 1000
+
+# 数据保留配置
+[retention]
+# 数据保留天数
+days = 1
+# 清理间隔（分钟）
+cleanup_interval_minutes = 60
+# 清理批次大小
+cleanup_batch_size = 1000
+# 清理批次间延迟（毫秒）
+cleanup_batch_delay_ms = 10
+
+# 日志配置
+[logging]
+# 日志文件路径（相对于工作目录或绝对路径）
+# 生产环境建议使用绝对路径：/opt/analysis/logs/analysis-collector.log
+# 注意：使用 tracing-appender 的 hourly rotation，日志文件会自动按小时轮转
+# 格式：analysis-collector.log -> analysis-collector.log.2024-01-01-14
+file = "/mnt/analysis/logs/analysis-collector.log"
+# 日志级别 (trace, debug, info, warn, error)
+# 也可以通过环境变量 RUST_LOG 覆盖
+level = "info"
+# 保留的日志文件数量（包括当前日志文件）
+# 超过此数量的旧文件将被自动删除
+# 默认值：168（7天，每小时一个文件）
+keep_files = 168
+
+# 拓扑配置（必需）
+# 拓扑文件用于获取设备SN到设备类型的映射，必须配置
+[topology]
+# 拓扑文件路径（相对于工作目录或绝对路径）
+# 例如：topo.json 或 /opt/analysis/topo.json
+file = "topo.json"
+
+# 字段映射配置（必需）
+# 用于配置不同设备类型的 JSON 字段到数据库表字段的映射
+# 键名是表字段名，值是JSON路径（支持嵌套，使用点号分隔）
+# 例如：{"soc": "battery.soc"} 表示从 payload.battery.soc 提取值，存储到表的 {sn}_soc 列
+# 所有字段映射完全依赖配置文件，无默认值
+[field_mapping]
+# 电表字段映射
+[field_mapping.meter]
+# 表字段名 = JSON路径（相对于payload）
+active_power = "activePower"
+reactive_power = "reactivePower"
+active_power_alg = "activePowerAlg"
+
+# 储能设备字段映射
+[field_mapping.storage]
+active_power = "activePower"
+reactive_power = "reactivePower"
+# 嵌套字段示例：从 payload.battery.soc 提取值，存储到表的 {sn}_soc 列
+# soc = "battery.soc"
+# soh = "battery.soh"
+
+# 光伏设备字段映射
+[field_mapping.pv]
+active_power = "activePower"
+reactive_power = "reactivePower"
+
+# 充电桩字段映射
+[field_mapping.charger]
+# 充电桩使用 OutP 作为有功功率
+active_power = "OutP"
+# 更深层嵌套示例
+# temperature = "status.sensors.temperature"
