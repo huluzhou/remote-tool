@@ -2,15 +2,16 @@ import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+export interface DeployFile {
+  localPath?: string;      // 本地文件路径（用于上传）
+  remotePath?: string;     // 远程文件路径（用于上传和下载）
+  downloadPath?: string;   // 下载到本地的路径（用于下载）
+}
+
 export interface DeployConfig {
-  binaryPath?: string;
-  configPath?: string;
-  topoPath?: string;
-  uploadBinary?: boolean;
-  uploadConfig: boolean;
-  uploadTopo: boolean;
-  useRoot: boolean;
-  startService: boolean;
+  files: DeployFile[];     // 文件列表
+  useRoot: boolean;        // 是否使用root用户
+  restartService: boolean; // 是否重启服务（上传默认true，下载默认false）
 }
 
 export interface DeployStatus {

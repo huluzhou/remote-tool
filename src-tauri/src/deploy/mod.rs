@@ -5,15 +5,18 @@ use tauri::AppHandle;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DeployFile {
+    pub local_path: Option<String>,
+    pub remote_path: Option<String>,
+    pub download_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeployConfig {
-    pub binary_path: Option<String>,
-    pub config_path: Option<String>,
-    pub topo_path: Option<String>,
-    pub upload_binary: Option<bool>,
-    pub upload_config: bool,
-    pub upload_topo: bool,
+    pub files: Vec<DeployFile>,
     pub use_root: bool,
-    pub start_service: bool,
+    pub restart_service: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -248,73 +251,91 @@ fn format_file_size(size: u64) -> String {
 pub async fn deploy_application(app_handle: Option<AppHandle>, config: DeployConfig) -> Result<Vec<String>, String> {
     let mut logs = Vec::new();
     
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "开始部署流程");
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
+    // 判断操作类型
+    let upload_files: Vec<&DeployFile> = config.files.iter()
+        .filter(|f| f.local_path.is_some() && f.remote_path.is_some())
+        .collect();
+    let download_files: Vec<&DeployFile> = config.files.iter()
+        .filter(|f| f.remote_path.is_some() && f.download_path.is_some())
+        .collect();
     
-    // 显示部署配置
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("部署配置:"));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 上传可执行文件: {}", config.upload_binary.unwrap_or(false)));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 上传配置文件: {}", config.upload_config));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 上传拓扑文件: {}", config.upload_topo));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 运行用户: {}", if config.use_root { "root" } else { SERVICE_USER }));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 部署后启动服务: {}", config.start_service));
-    
-    // 检查部署状态
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "检查当前部署状态...");
-    let status = match check_deploy_status().await {
-        Ok(s) => {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  可执行文件: {}", if s.installed { "已安装" } else { "未安装" }));
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务文件: {}", if s.service_exists { "存在" } else { "不存在" }));
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务状态: {}", if s.service_running { "运行中" } else { "未运行" }));
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务启用: {}", if s.service_enabled { "已启用" } else { "未启用" }));
-            s
-        }
-        Err(e) => {
-            let err_msg = format!("检查部署状态失败: {}", e);
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ {}", err_msg));
-            return Err(err_msg);
-        }
+    let operation_type = if !upload_files.is_empty() {
+        "上传"
+    } else if !download_files.is_empty() {
+        "下载"
+    } else if config.restart_service {
+        "重启服务"
+    } else {
+        return Err("无效的操作：没有选择上传、下载或重启服务".to_string());
     };
     
-    let is_update = status.installed;
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("部署模式: {}", if is_update { "更新" } else { "新部署" }));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("开始{}流程", operation_type));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
     
-    // 判断是否需要重启服务
-    // 如果只上传配置文件或拓扑文件，且服务正在运行，需要重启服务以加载新配置
-    let need_restart = status.service_running && (
-        config.upload_config || 
-        config.upload_topo
-    );
+    // 显示操作配置
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("操作配置:"));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 操作类型: {}", operation_type));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 上传文件数: {}", upload_files.len()));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 下载文件数: {}", download_files.len()));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 运行用户: {}", if config.use_root { "root" } else { SERVICE_USER }));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  - 重启服务: {}", config.restart_service));
     
-    // 如果是更新（上传可执行文件）或需要重启服务（上传配置文件/拓扑文件），先停止服务
-    if (is_update && status.service_running) || need_restart {
-        add_log_and_emit(app_handle.as_ref(), &mut logs, "停止现有服务...");
-        let stop_cmd = format!("sudo systemctl stop {}", SERVICE_NAME);
-        match SshClient::execute_command(&stop_cmd).await {
-            Ok((exit_status, stdout, stderr)) => {
-                if exit_status == 0 {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已停止");
-                    if let Some(output) = filter_benign_warnings(&stdout) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
-                    }
-                } else {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 停止服务返回非零退出码: {}", exit_status));
-                    if let Some(error) = filter_benign_warnings(&stderr) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  错误: {}", error));
-                    }
-                }
+    // 检查部署状态（仅在上传或重启服务时检查）
+    let status = if !upload_files.is_empty() || config.restart_service {
+        add_log_and_emit(app_handle.as_ref(), &mut logs, "检查当前部署状态...");
+        match check_deploy_status().await {
+            Ok(s) => {
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  可执行文件: {}", if s.installed { "已安装" } else { "未安装" }));
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务文件: {}", if s.service_exists { "存在" } else { "不存在" }));
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务状态: {}", if s.service_running { "运行中" } else { "未运行" }));
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务启用: {}", if s.service_enabled { "已启用" } else { "未启用" }));
+                Some(s)
             }
             Err(e) => {
-                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ 停止服务失败: {}", e));
+                let err_msg = format!("检查部署状态失败: {}", e);
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ {}", err_msg));
+                return Err(err_msg);
+            }
+        }
+    } else {
+        None
+    };
+    
+    // 如果是上传操作且服务正在运行，先停止服务
+    if !upload_files.is_empty() {
+        if let Some(ref status) = status {
+            if status.service_running {
+                add_log_and_emit(app_handle.as_ref(), &mut logs, "停止现有服务...");
+                let stop_cmd = format!("sudo systemctl stop {}", SERVICE_NAME);
+                match SshClient::execute_command(&stop_cmd).await {
+                    Ok((exit_status, stdout, stderr)) => {
+                        if exit_status == 0 {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已停止");
+                            if let Some(output) = filter_benign_warnings(&stdout) {
+                                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
+                            }
+                        } else {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 停止服务返回非零退出码: {}", exit_status));
+                            if let Some(error) = filter_benign_warnings(&stderr) {
+                                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  错误: {}", error));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ 停止服务失败: {}", e));
+                    }
+                }
             }
         }
     }
     
-    // 创建目录结构
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("创建目录结构: {}/bin", INSTALL_DIR));
-    let mkdir_cmd = format!("sudo mkdir -p {}/bin", INSTALL_DIR);
-    match SshClient::execute_command(&mkdir_cmd).await {
+    // 处理文件上传
+    if !upload_files.is_empty() {
+        // 创建目录结构（如果需要）
+        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("创建目录结构: {}/bin", INSTALL_DIR));
+        let mkdir_cmd = format!("sudo mkdir -p {}/bin", INSTALL_DIR);
+        match SshClient::execute_command(&mkdir_cmd).await {
             Ok((exit_status, stdout, stderr)) => {
                 if exit_status == 0 {
                     add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 目录结构创建成功");
@@ -324,267 +345,209 @@ pub async fn deploy_application(app_handle: Option<AppHandle>, config: DeployCon
                 } else {
                     let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
                     let err_msg = format!("创建目录失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-                    return Err(err_msg);
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ {}", err_msg));
                 }
             }
-        Err(e) => {
-            let err_msg = format!("创建目录失败: {}", e);
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-            return Err(err_msg);
+            Err(e) => {
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 创建目录失败: {}", e));
+            }
         }
-    }
-    
-    // 上传可执行文件（如果选择）
-    if config.upload_binary.unwrap_or(false) {
-        if let Some(ref binary_path) = config.binary_path {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "上传可执行文件...");
+        
+        // 上传每个文件
+        for (idx, file) in upload_files.iter().enumerate() {
+            let local_path = file.local_path.as_ref().unwrap();
+            let remote_path = file.remote_path.as_ref().unwrap();
+            
+            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("上传文件 {}/{}: {}", idx + 1, upload_files.len(), remote_path));
             
             // 检查本地文件
-            match std::fs::metadata(binary_path) {
+            match std::fs::metadata(local_path) {
                 Ok(metadata) => {
                     let file_size = metadata.len();
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  本地文件: {}", binary_path));
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  本地文件: {}", local_path));
                     add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  文件大小: {}", format_file_size(file_size)));
                 }
                 Err(e) => {
-                    let err_msg = format!("无法读取本地文件 {}: {}", binary_path, e);
+                    let err_msg = format!("无法读取本地文件 {}: {}", local_path, e);
                     add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
                     return Err(err_msg);
                 }
             }
             
-            let temp_remote = format!("/tmp/{}", BINARY_NAME);
+            // 生成临时文件名
+            let file_name = remote_path.split('/').last().unwrap_or("file");
+            let temp_remote = format!("/tmp/{}", file_name);
             add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  上传到临时位置: {}", temp_remote));
             
-            match SshClient::upload_file(binary_path, &temp_remote).await {
+            // 上传文件
+            match SshClient::upload_file(local_path, &temp_remote).await {
                 Ok(_) => {
                     add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 文件上传成功");
                 }
                 Err(e) => {
-                    let err_msg = format!("上传可执行文件失败: {}", e);
+                    let err_msg = format!("上传文件失败: {}", e);
                     add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
                     return Err(err_msg);
                 }
             }
             
-            // 验证远程文件
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "验证远程文件...");
-            let verify_cmd = format!("test -f {} && ls -lh {} | awk '{{print $5}}'", temp_remote, temp_remote);
-            match SshClient::execute_command(&verify_cmd).await {
-                Ok((_, stdout, _)) => {
-                    if let Some(output) = filter_benign_warnings(&stdout) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  远程文件大小: {}", output));
+            // 移动到目标位置并设置权限
+            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("部署文件到目标位置: {}", remote_path));
+            
+            // 获取目标目录
+            let remote_dir = remote_path.rsplit('/').skip(1).collect::<Vec<&str>>().join("/");
+            let mkdir_cmd = if !remote_dir.is_empty() {
+                format!("sudo mkdir -p '{}'", remote_dir)
+            } else {
+                String::new()
+            };
+            
+            if !mkdir_cmd.is_empty() {
+                match SshClient::execute_command(&mkdir_cmd).await {
+                    Ok(_) => {
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 目录创建成功"));
+                    }
+                    Err(e) => {
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 创建目录失败: {}", e));
                     }
                 }
-                Err(_) => {}
             }
             
-            // 使用 rm -f 确保能覆盖已存在的文件，然后移动并设置权限
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "部署可执行文件到目标位置...");
-            let move_cmd = format!(
-                "sudo rm -f '{}/bin/{}' && sudo mv '{}' '{}/bin/{}' && sudo chmod +x '{}/bin/{}' && sudo chown root:root '{}/bin/{}'",
-                INSTALL_DIR, BINARY_NAME, temp_remote, INSTALL_DIR, BINARY_NAME, INSTALL_DIR, BINARY_NAME, INSTALL_DIR, BINARY_NAME
-            );
+            // 判断文件类型，设置不同的权限
+            let is_binary = remote_path.contains("/bin/") || !remote_path.ends_with(".toml") && !remote_path.ends_with(".json");
+            let move_cmd = if is_binary {
+                format!(
+                    "sudo rm -f '{}' && sudo mv '{}' '{}' && sudo chmod +x '{}' && sudo chown root:root '{}'",
+                    remote_path, temp_remote, remote_path, remote_path, remote_path
+                )
+            } else {
+                format!(
+                    "sudo rm -f '{}' && sudo mv '{}' '{}' && sudo chmod 644 '{}'",
+                    remote_path, temp_remote, remote_path, remote_path
+                )
+            };
+            
             match SshClient::execute_command(&move_cmd).await {
                 Ok((exit_status, stdout, stderr)) => {
                     if exit_status == 0 {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 可执行文件部署成功: {}/bin/{}", INSTALL_DIR, BINARY_NAME));
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 文件部署成功: {}", remote_path));
                         if let Some(output) = filter_benign_warnings(&stdout) {
                             add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
                         }
                     } else {
                         let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
-                        let err_msg = format!("部署可执行文件失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
+                        let err_msg = format!("部署文件失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
                         add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
                         return Err(err_msg);
                     }
                 }
                 Err(e) => {
-                    let err_msg = format!("部署可执行文件失败: {}", e);
+                    let err_msg = format!("部署文件失败: {}", e);
                     add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
                     return Err(err_msg);
                 }
             }
-        } else {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "  ⚠️ 警告: 选择了上传可执行文件但未提供文件路径");
         }
     }
     
-    // 上传配置文件（如果选择）
-    if config.upload_config {
-        if let Some(ref config_path) = config.config_path {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "上传配置文件...");
+    // 处理文件下载
+    if !download_files.is_empty() {
+        for (idx, file) in download_files.iter().enumerate() {
+            let remote_path = file.remote_path.as_ref().unwrap();
+            let download_path = file.download_path.as_ref().unwrap();
             
-            // 检查本地文件
-            match std::fs::metadata(config_path) {
-                Ok(metadata) => {
-                    let file_size = metadata.len();
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  本地文件: {}", config_path));
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  文件大小: {}", format_file_size(file_size)));
+            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("下载文件 {}/{}: {} -> {}", idx + 1, download_files.len(), remote_path, download_path));
+            
+            // 检查远程文件是否存在
+            let check_cmd = format!("test -f '{}' && echo 'exists' || echo 'not_exists'", remote_path);
+            match SshClient::execute_command(&check_cmd).await {
+                Ok((_, stdout, _)) => {
+                    if stdout.trim() == "exists" {
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 远程文件存在");
+                    } else {
+                        let err_msg = format!("远程文件不存在: {}", remote_path);
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                        return Err(err_msg);
+                    }
                 }
                 Err(e) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 无法读取本地文件 {}: {}", config_path, e));
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 检查远程文件失败: {}", e));
                 }
             }
             
-            let temp_config = "/tmp/config.toml";
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  上传到临时位置: {}", temp_config));
-            
-            match SshClient::upload_file(config_path, temp_config).await {
+            // 下载文件
+            match SshClient::download_file(remote_path, download_path).await {
                 Ok(_) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 文件上传成功");
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 文件下载成功: {}", download_path));
                 }
                 Err(e) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ 上传配置文件失败: {}", e));
+                    let err_msg = format!("下载文件失败: {}", e);
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                    return Err(err_msg);
                 }
             }
-            
-            // 使用 rm -f 确保能覆盖已存在的文件
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "部署配置文件到目标位置...");
-            let move_config_cmd = format!(
-                "sudo rm -f '{}/config.toml' && sudo mv '{}' '{}/config.toml' && sudo chmod 644 '{}/config.toml'",
-                INSTALL_DIR, temp_config, INSTALL_DIR, INSTALL_DIR
+        }
+    }
+    
+    // 设置权限（仅在上传文件时设置）
+    if !upload_files.is_empty() {
+        add_log_and_emit(app_handle.as_ref(), &mut logs, "设置权限...");
+        if !config.use_root {
+            // 创建用户
+            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("创建运行用户: {}", SERVICE_USER));
+            let create_user_cmd = format!(
+                "id {} 2>/dev/null || sudo useradd -r -s /bin/false {}",
+                SERVICE_USER, SERVICE_USER
             );
-            match SshClient::execute_command(&move_config_cmd).await {
+            match SshClient::execute_command(&create_user_cmd).await {
                 Ok((exit_status, stdout, stderr)) => {
                     if exit_status == 0 {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 配置文件部署成功: {}/config.toml", INSTALL_DIR));
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 用户 {} 已存在或创建成功", SERVICE_USER));
                         if let Some(output) = filter_benign_warnings(&stdout) {
                             add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
                         }
                     } else {
-                        let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
-                        if !filtered_stderr.is_empty() {
-                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 配置文件部署失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr));
+                        if let Some(error) = filter_benign_warnings(&stderr) {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 创建用户失败: 退出码 {}, 错误: {}", exit_status, error));
                         }
                     }
                 }
                 Err(e) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 配置文件部署失败: {}", e));
-                }
-            }
-        } else {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "  ⚠️ 警告: 选择了上传配置文件但未提供文件路径");
-        }
-    }
-    
-    // 上传拓扑文件（如果选择）
-    if config.upload_topo {
-        if let Some(ref topo_path) = config.topo_path {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "上传拓扑文件...");
-            
-            // 检查本地文件
-            match std::fs::metadata(topo_path) {
-                Ok(metadata) => {
-                    let file_size = metadata.len();
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  本地文件: {}", topo_path));
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  文件大小: {}", format_file_size(file_size)));
-                }
-                Err(e) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 无法读取本地文件 {}: {}", topo_path, e));
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 创建用户失败: {}", e));
                 }
             }
             
-            let temp_topo = "/tmp/topo.json";
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  上传到临时位置: {}", temp_topo));
-            
-            match SshClient::upload_file(topo_path, temp_topo).await {
-                Ok(_) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 文件上传成功");
-                }
-                Err(e) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ 上传拓扑文件失败: {}", e));
-                }
-            }
-            
-            // 使用 rm -f 确保能覆盖已存在的文件
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "部署拓扑文件到目标位置...");
-            let move_topo_cmd = format!(
-                "sudo rm -f '{}/topo.json' && sudo mv '{}' '{}/topo.json' && sudo chmod 644 '{}/topo.json'",
-                INSTALL_DIR, temp_topo, INSTALL_DIR, INSTALL_DIR
+            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("设置目录所有者: {}:{}", SERVICE_USER, SERVICE_USER));
+            let chown_cmd = format!(
+                "sudo chown -R {}:{} {}",
+                SERVICE_USER, SERVICE_USER, INSTALL_DIR
             );
-            match SshClient::execute_command(&move_topo_cmd).await {
+            match SshClient::execute_command(&chown_cmd).await {
                 Ok((exit_status, stdout, stderr)) => {
                     if exit_status == 0 {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 拓扑文件部署成功: {}/topo.json", INSTALL_DIR));
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 权限设置成功");
                         if let Some(output) = filter_benign_warnings(&stdout) {
                             add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
                         }
                     } else {
-                        let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
-                        if !filtered_stderr.is_empty() {
-                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 拓扑文件部署失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr));
+                        if let Some(error) = filter_benign_warnings(&stderr) {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 权限设置失败: 退出码 {}, 错误: {}", exit_status, error));
                         }
                     }
                 }
                 Err(e) => {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 拓扑文件部署失败: {}", e));
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 权限设置失败: {}", e));
                 }
             }
         } else {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "  ⚠️ 警告: 选择了上传拓扑文件但未提供文件路径");
-        }
-    }
-    
-    // 设置权限
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "设置权限...");
-    if !config.use_root {
-        // 创建用户
-        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("创建运行用户: {}", SERVICE_USER));
-        let create_user_cmd = format!(
-            "id {} 2>/dev/null || sudo useradd -r -s /bin/false {}",
-            SERVICE_USER, SERVICE_USER
-        );
-        match SshClient::execute_command(&create_user_cmd).await {
-            Ok((exit_status, stdout, stderr)) => {
-                if exit_status == 0 {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 用户 {} 已存在或创建成功", SERVICE_USER));
-                    if let Some(output) = filter_benign_warnings(&stdout) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
-                    }
-                } else {
-                    if let Some(error) = filter_benign_warnings(&stderr) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 创建用户失败: 退出码 {}, 错误: {}", exit_status, error));
-                    }
-                }
-            }
-            Err(e) => {
-                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 创建用户失败: {}", e));
-            }
+            add_log_and_emit(app_handle.as_ref(), &mut logs, "使用 root 用户运行，跳过权限设置");
         }
         
-        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("设置目录所有者: {}:{}", SERVICE_USER, SERVICE_USER));
-        let chown_cmd = format!(
-            "sudo chown -R {}:{} {}",
-            SERVICE_USER, SERVICE_USER, INSTALL_DIR
-        );
-        match SshClient::execute_command(&chown_cmd).await {
-            Ok((exit_status, stdout, stderr)) => {
-                if exit_status == 0 {
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 权限设置成功");
-                    if let Some(output) = filter_benign_warnings(&stdout) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
-                    }
-                } else {
-                    if let Some(error) = filter_benign_warnings(&stderr) {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 权限设置失败: 退出码 {}, 错误: {}", exit_status, error));
-                    }
-                }
-            }
-            Err(e) => {
-                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 权限设置失败: {}", e));
-            }
-        }
-    } else {
-        add_log_and_emit(app_handle.as_ref(), &mut logs, "使用 root 用户运行，跳过权限设置");
-    }
-    
-    // 创建服务文件
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("创建服务文件: {}", SERVICE_FILE));
-    let service_content = if config.use_root {
-        format!(
-            r#"[Unit]
+        // 创建服务文件（仅在上传文件时创建）
+        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("创建服务文件: {}", SERVICE_FILE));
+        let service_content = if config.use_root {
+            format!(
+                r#"[Unit]
 Description=Analysis Data Collector
 After=network.target
 
@@ -597,11 +560,11 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target"#,
-            INSTALL_DIR, INSTALL_DIR, BINARY_NAME, INSTALL_DIR
-        )
-    } else {
-        format!(
-            r#"[Unit]
+                INSTALL_DIR, INSTALL_DIR, BINARY_NAME, INSTALL_DIR
+            )
+        } else {
+            format!(
+                r#"[Unit]
 Description=Analysis Data Collector
 After=network.target
 
@@ -615,45 +578,45 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target"#,
-            SERVICE_USER, INSTALL_DIR, INSTALL_DIR, BINARY_NAME, INSTALL_DIR
-        )
-    };
-    
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "生成服务文件内容...");
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  工作目录: {}", INSTALL_DIR));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  可执行文件: {}/bin/{}", INSTALL_DIR, BINARY_NAME));
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  配置文件: {}/config.toml", INSTALL_DIR));
-    
-    let temp_service = "/tmp/analysis-collector.service";
-    match std::fs::write(temp_service, &service_content) {
-        Ok(_) => {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 临时服务文件已创建: {}", temp_service));
+                SERVICE_USER, INSTALL_DIR, INSTALL_DIR, BINARY_NAME, INSTALL_DIR
+            )
+        };
+        
+        add_log_and_emit(app_handle.as_ref(), &mut logs, "生成服务文件内容...");
+        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  工作目录: {}", INSTALL_DIR));
+        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  可执行文件: {}/bin/{}", INSTALL_DIR, BINARY_NAME));
+        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  配置文件: {}/config.toml", INSTALL_DIR));
+        
+        let temp_service = "/tmp/analysis-collector.service";
+        match std::fs::write(temp_service, &service_content) {
+            Ok(_) => {
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 临时服务文件已创建: {}", temp_service));
+            }
+            Err(e) => {
+                let err_msg = format!("创建临时服务文件失败: {}", e);
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                return Err(err_msg);
+            }
         }
-        Err(e) => {
-            let err_msg = format!("创建临时服务文件失败: {}", e);
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-            return Err(err_msg);
+        
+        add_log_and_emit(app_handle.as_ref(), &mut logs, "上传服务文件...");
+        match SshClient::upload_file(temp_service, temp_service).await {
+            Ok(_) => {
+                add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务文件上传成功");
+            }
+            Err(e) => {
+                let err_msg = format!("上传服务文件失败: {}", e);
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                return Err(err_msg);
+            }
         }
-    }
-    
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "上传服务文件...");
-    match SshClient::upload_file(temp_service, temp_service).await {
-        Ok(_) => {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务文件上传成功");
-        }
-        Err(e) => {
-            let err_msg = format!("上传服务文件失败: {}", e);
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-            return Err(err_msg);
-        }
-    }
-    
-    add_log_and_emit(app_handle.as_ref(), &mut logs, "部署服务文件并重新加载 systemd...");
-    let move_service_cmd = format!(
-        "sudo mv '{}' '{}' && sudo systemctl daemon-reload",
-        temp_service, SERVICE_FILE
-    );
-    match SshClient::execute_command(&move_service_cmd).await {
+        
+        add_log_and_emit(app_handle.as_ref(), &mut logs, "部署服务文件并重新加载 systemd...");
+        let move_service_cmd = format!(
+            "sudo mv '{}' '{}' && sudo systemctl daemon-reload",
+            temp_service, SERVICE_FILE
+        );
+        match SshClient::execute_command(&move_service_cmd).await {
             Ok((exit_status, stdout, stderr)) => {
                 if exit_status == 0 {
                     add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✓ 服务文件部署成功: {}", SERVICE_FILE));
@@ -668,20 +631,111 @@ WantedBy=multi-user.target"#,
                     return Err(err_msg);
                 }
             }
-        Err(e) => {
-            let err_msg = format!("创建服务文件失败: {}", e);
-            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-            return Err(err_msg);
+            Err(e) => {
+                let err_msg = format!("创建服务文件失败: {}", e);
+                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                return Err(err_msg);
+            }
         }
     }
     
-    // 启用并启动/重启服务
-    // 如果需要重启服务（上传配置文件或拓扑文件），即使 start_service 为 false 也要重启
-    if config.start_service || need_restart {
-        if need_restart && !config.start_service {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "检测到配置文件或拓扑文件更新，需要重启服务以加载新配置...");
+    // 处理服务重启
+    if config.restart_service {
+        // 获取服务状态用于重启
+        let service_running = if let Some(ref s) = status {
+            s.service_running
+        } else {
+            // 如果没有状态，重新检查
+            add_log_and_emit(app_handle.as_ref(), &mut logs, "检查服务状态...");
+            match check_deploy_status().await {
+                Ok(s) => {
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  服务状态: {}", if s.service_running { "运行中" } else { "未运行" }));
+                    s.service_running
+                }
+                Err(e) => {
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ⚠️ 检查服务状态失败: {}，尝试直接重启服务", e));
+                    // 直接尝试重启服务
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, "重启服务...");
+                    let restart_cmd = format!("sudo systemctl restart {}", SERVICE_NAME);
+                    match SshClient::execute_command(&restart_cmd).await {
+                        Ok((exit_status, stdout, stderr)) => {
+                            if exit_status == 0 {
+                                add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已重启");
+                                if let Some(output) = filter_benign_warnings(&stdout) {
+                                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
+                                }
+                            } else {
+                                let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
+                                let err_msg = format!("重启服务失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
+                                add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                                return Err(err_msg);
+                            }
+                        }
+                        Err(e) => {
+                            let err_msg = format!("重启服务失败: {}", e);
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                            return Err(err_msg);
+                        }
+                    }
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, "重启服务完成！");
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
+                    return Ok(logs);
+                }
+            }
+        };
+        
+        if service_running {
+            // 服务正在运行，执行重启
+            add_log_and_emit(app_handle.as_ref(), &mut logs, "重启服务...");
+            let restart_cmd = format!("sudo systemctl restart {}", SERVICE_NAME);
+            match SshClient::execute_command(&restart_cmd).await {
+                Ok((exit_status, stdout, stderr)) => {
+                    if exit_status == 0 {
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已重启");
+                        if let Some(output) = filter_benign_warnings(&stdout) {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
+                        }
+                    } else {
+                        let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
+                        let err_msg = format!("重启服务失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                        return Err(err_msg);
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("重启服务失败: {}", e);
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                    return Err(err_msg);
+                }
+            }
+        } else {
+            // 服务未运行，执行启动
+            add_log_and_emit(app_handle.as_ref(), &mut logs, "启动服务...");
+            let start_cmd = format!("sudo systemctl start {}", SERVICE_NAME);
+            match SshClient::execute_command(&start_cmd).await {
+                Ok((exit_status, stdout, stderr)) => {
+                    if exit_status == 0 {
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已启动");
+                        if let Some(output) = filter_benign_warnings(&stdout) {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
+                        }
+                    } else {
+                        let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
+                        let err_msg = format!("启动服务失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
+                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                        return Err(err_msg);
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("启动服务失败: {}", e);
+                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
+                    return Err(err_msg);
+                }
+            }
         }
         
+        // 启用服务
         add_log_and_emit(app_handle.as_ref(), &mut logs, "启用服务...");
         let enable_cmd = format!("sudo systemctl enable {}", SERVICE_NAME);
         match SshClient::execute_command(&enable_cmd).await {
@@ -702,95 +756,28 @@ WantedBy=multi-user.target"#,
             }
         }
         
-        // 如果服务之前已经在运行（需要重启），使用 restart；否则使用 start
-        if need_restart {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "重启服务以加载新配置...");
-            let restart_cmd = format!("sudo systemctl restart {}", SERVICE_NAME);
-            match SshClient::execute_command(&restart_cmd).await {
-                Ok((exit_status, stdout, stderr)) => {
-                    if exit_status == 0 {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已重启");
-                        if let Some(output) = filter_benign_warnings(&stdout) {
-                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
+        // 验证服务状态
+        add_log_and_emit(app_handle.as_ref(), &mut logs, "验证服务状态...");
+        let status_cmd = format!("sudo systemctl status {} --no-pager -l", SERVICE_NAME);
+        match SshClient::execute_command(&status_cmd).await {
+            Ok((_, status_output, _)) => {
+                if let Some(output) = filter_benign_warnings(&status_output) {
+                    let status_lines: Vec<&str> = output.lines().take(3).collect();
+                    for line in status_lines {
+                        if !line.trim().is_empty() {
+                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  {}", line));
                         }
-                        
-                        // 验证服务状态
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, "验证服务状态...");
-                        let status_cmd = format!("sudo systemctl status {} --no-pager -l", SERVICE_NAME);
-                        match SshClient::execute_command(&status_cmd).await {
-                            Ok((_, status_output, _)) => {
-                                if let Some(output) = filter_benign_warnings(&status_output) {
-                                    let status_lines: Vec<&str> = output.lines().take(3).collect();
-                                    for line in status_lines {
-                                        if !line.trim().is_empty() {
-                                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  {}", line));
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    } else {
-                        let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
-                        let err_msg = format!("重启服务失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-                        return Err(err_msg);
                     }
                 }
-                Err(e) => {
-                    let err_msg = format!("重启服务失败: {}", e);
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-                    return Err(err_msg);
-                }
             }
-        } else {
-            add_log_and_emit(app_handle.as_ref(), &mut logs, "启动服务...");
-            let start_cmd = format!("sudo systemctl start {}", SERVICE_NAME);
-            match SshClient::execute_command(&start_cmd).await {
-                Ok((exit_status, stdout, stderr)) => {
-                    if exit_status == 0 {
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, "  ✓ 服务已启动");
-                        if let Some(output) = filter_benign_warnings(&stdout) {
-                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  输出: {}", output));
-                        }
-                        
-                        // 验证服务状态
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, "验证服务状态...");
-                        let status_cmd = format!("sudo systemctl status {} --no-pager -l", SERVICE_NAME);
-                        match SshClient::execute_command(&status_cmd).await {
-                            Ok((_, status_output, _)) => {
-                                if let Some(output) = filter_benign_warnings(&status_output) {
-                                    let status_lines: Vec<&str> = output.lines().take(3).collect();
-                                    for line in status_lines {
-                                        if !line.trim().is_empty() {
-                                            add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  {}", line));
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    } else {
-                        let filtered_stderr = filter_benign_warnings(&stderr).unwrap_or_else(|| stderr.trim().to_string());
-                        let err_msg = format!("启动服务失败: 退出码 {}, 错误: {}", exit_status, filtered_stderr);
-                        add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-                        return Err(err_msg);
-                    }
-                }
-                Err(e) => {
-                    let err_msg = format!("启动服务失败: {}", e);
-                    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("  ✗ {}", err_msg));
-                    return Err(err_msg);
-                }
-            }
+            Err(_) => {}
         }
-    } else {
-        add_log_and_emit(app_handle.as_ref(), &mut logs, "跳过服务启动（未选择启动服务选项）");
     }
     
     add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
-    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("{}完成！", if is_update { "更新" } else { "部署" }));
+    add_log_and_emit(app_handle.as_ref(), &mut logs, &format!("{}完成！", operation_type));
     add_log_and_emit(app_handle.as_ref(), &mut logs, "=========================================");
     
     Ok(logs)
 }
+
