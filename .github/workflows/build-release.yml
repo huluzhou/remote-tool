@@ -55,4 +55,6 @@ jobs:
             - 自动更新：支持从GitHub Releases自动更新
           releaseDraft: false
           prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
           args: --target x86_64-pc-windows-msvc

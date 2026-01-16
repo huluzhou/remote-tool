@@ -33,18 +33,10 @@ export const useDeployStore = defineStore("deploy", {
     async checkStatus(): Promise<void> {
       this.error = null;
       try {
-        console.log("[DEBUG] 开始检查部署状态...");
         const status = await invoke<DeployStatus>("check_deploy_status");
-        console.log("[DEBUG] 状态检查结果:", {
-          installed: status.installed,
-          serviceExists: status.serviceExists,
-          serviceRunning: status.serviceRunning,
-          serviceEnabled: status.serviceEnabled,
-        });
         this.status = status;
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
-        console.error("[DEBUG] 状态检查失败:", errorMsg);
         this.error = errorMsg;
       }
     },

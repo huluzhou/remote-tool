@@ -4,7 +4,7 @@
     <div v-if="sshStore.isConnected" class="deploy-container">
       <div class="deploy-sections">
         <DeployForm @deploy="handleDeploy" />
-        <StatusCheck @check="handleCheckStatus" />
+        <StatusCheck />
       </div>
       <DeployLog 
         :logs="deployStore.logs" 
@@ -34,13 +34,10 @@ const handleDeploy = async (config: any) => {
   await deployStore.deploy(config);
 };
 
-const handleCheckStatus = async () => {
-  await deployStore.checkStatus();
-};
-
 onMounted(() => {
+  // 如果已连接，自动检查一次状态
   if (sshStore.isConnected) {
-    handleCheckStatus();
+    deployStore.checkStatus();
   }
 });
 </script>
