@@ -209,7 +209,7 @@
 * 部署后是否启动服务，启动的话会执行 
   
   ```bash
-  systemctl start analysis-collector
+  systemctl start ancol
   ```
 
 * 部署日志：输出部署过程操作

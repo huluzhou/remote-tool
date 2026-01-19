@@ -116,7 +116,7 @@ watch(() => deployStore.deploying, (newValue) => {
 const getDefaultFiles = (): DeployFile[] => {
   return [
     {
-      remotePath: "/opt/analysis/bin/analysis-collector",
+      remotePath: "/opt/analysis/bin/ancol",
     },
     {
       remotePath: "/opt/analysis/config.toml",

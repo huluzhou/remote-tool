@@ -1,6 +1,6 @@
 {
   "name": "remote-tool",
-  "version": "2.0.5",
+  "version": "2.1.0",
   "description": "Remote tool for data query and application deployment",
   "type": "module",
   "scripts": {
