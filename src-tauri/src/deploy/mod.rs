@@ -30,9 +30,9 @@ pub struct DeployStatus {
 }
 
 const INSTALL_DIR: &str = "/opt/analysis";
-const SERVICE_NAME: &str = "analysis-collector";
-const BINARY_NAME: &str = "analysis-collector";
-const SERVICE_FILE: &str = "/etc/systemd/system/analysis-collector.service";
+const SERVICE_NAME: &str = "ancol";
+const BINARY_NAME: &str = "ancol";
+const SERVICE_FILE: &str = "/etc/systemd/system/ancol.service";
 const SERVICE_USER: &str = "analysis";
 
 pub async fn check_deploy_status() -> Result<DeployStatus, String> {
