@@ -10,7 +10,7 @@
         <span :class="['status-value', status.installed ? 'success' : 'error']">
           {{ status.installed ? "是" : "否" }}
         </span>
-        <span class="status-path" v-if="!status.installed">(路径: /opt/analysis/bin/analysis-collector)</span>
+        <span class="status-path" v-if="!status.installed">(路径: /opt/analysis/bin/ancol)</span>
       </div>
       <div class="status-item">
         <span class="status-label">服务文件存在:</span>
@@ -19,7 +19,7 @@
         >
           {{ status.serviceExists ? "是" : "否" }}
         </span>
-        <span class="status-path" v-if="!status.serviceExists">(路径: /etc/systemd/system/analysis-collector.service)</span>
+        <span class="status-path" v-if="!status.serviceExists">(路径: /etc/systemd/system/ancol.service)</span>
       </div>
       <div class="status-item">
         <span class="status-label">服务运行中:</span>

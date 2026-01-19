@@ -1,4 +1,4 @@
-# Analysis Collector 配置文件示例
+# Ancol 配置文件示例
 # 复制此文件为 config.toml 并根据需要修改
 
 # NNG 配置
@@ -31,7 +31,7 @@ max_command_files = 1000
 # 数据保留配置
 [retention]
 # 数据保留天数
-days = 1
+days = 7
 # 清理间隔（分钟）
 cleanup_interval_minutes = 60
 # 清理批次大小
@@ -42,10 +42,10 @@ cleanup_batch_delay_ms = 10
 # 日志配置
 [logging]
 # 日志文件路径（相对于工作目录或绝对路径）
-# 生产环境建议使用绝对路径：/opt/analysis/logs/analysis-collector.log
+# 生产环境建议使用绝对路径：/opt/analysis/logs/ancol.log
 # 注意：使用 tracing-appender 的 hourly rotation，日志文件会自动按小时轮转
-# 格式：analysis-collector.log -> analysis-collector.log.2024-01-01-14
-file = "/mnt/analysis/logs/analysis-collector.log"
+# 格式：ancol.log -> ancol.log.2024-01-01-14
+file = "/mnt/analysis/logs/ancol.log"
 # 日志级别 (trace, debug, info, warn, error)
 # 也可以通过环境变量 RUST_LOG 覆盖
 level = "info"
