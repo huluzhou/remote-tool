@@ -39,48 +39,49 @@ jobs:
           $exePath = "$targetDir\remote-tool.exe"
           $zipName = "remote-tool-portable-${{ github.ref_name }}.zip"
           
-          # 检查可执行文件是否存在
+          # Check if executable exists
           if (-not (Test-Path $exePath)) {
-            Write-Error "可执行文件不存在: $exePath"
+            Write-Error "Executable not found: $exePath"
             exit 1
           }
           
-          Write-Host "找到可执行文件: remote-tool.exe"
+          Write-Host "Found executable: remote-tool.exe"
           $exeSize = [math]::Round((Get-Item $exePath).Length / 1MB, 2)
-          Write-Host "文件大小: $exeSize MB"
+          Write-Host "File size: $exeSize MB"
           
-          # 创建临时目录用于打包
+          # Create temporary directory for packaging
           $packageDir = "portable-package"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           
-          # 复制可执行文件
+          # Copy executable
           Copy-Item $exePath "$packageDir\remote-tool.exe"
           
-          # 检查并复制依赖的 DLL 文件（如果有）
+          # Check and copy DLL files if any
           $dllFiles = Get-ChildItem -Path $targetDir -Filter "*.dll" -ErrorAction SilentlyContinue
           if ($dllFiles) {
             foreach ($dll in $dllFiles) {
               Copy-Item $dll.FullName $packageDir\
-              Write-Host "已复制 DLL: $($dll.Name)"
+              Write-Host "Copied DLL: $($dll.Name)"
             }
           } else {
-            Write-Host "未发现额外的 DLL 文件（这是正常的，Rust 程序通常静态链接）"
+            Write-Host "No additional DLL files found (this is normal, Rust programs are usually statically linked)"
           }
           
-          # 创建压缩包
+          # Create zip archive
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
           
           $zipSize = [math]::Round((Get-Item $zipName).Length / 1MB, 2)
-          Write-Host "已创建便携版压缩包: $zipName ($zipSize MB)"
+          Write-Host "Created portable package: $zipName ($zipSize MB)"
           
-          # 列出压缩包内容
-          Write-Host "`n压缩包内容:"
+          # List zip contents
+          Write-Host ""
+          Write-Host "Zip contents:"
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($zipName)
           $zip.Entries | ForEach-Object { Write-Host "  - $($_.FullName)" }
           $zip.Dispose()
           
-          # 清理临时目录
+          # Cleanup temporary directory
           Remove-Item -Path $packageDir -Recurse -Force
 
       - name: Create Release
