@@ -17,6 +17,13 @@ export interface ExportWideTableParams {
   outputPath: string;
 }
 
+export interface ExportDemandResultsParams {
+  dbPath: string;
+  startTime: number;
+  endTime: number;
+  outputPath: string;
+}
+
 export interface QueryResult {
   columns: string[];
   rows: Record<string, any>[];
@@ -55,6 +62,42 @@ export const useQueryStore = defineStore("query", {
         this.updateProgress(10, "开始导出...");
         
         const rowCount = await invoke<number>("export_wide_table_direct", { params });
+        
+        this.exportedRows = rowCount;
+        this.exportedPath = params.outputPath;
+        this.progress = 100;
+        this.progressMessage = `导出完成 (${rowCount} 条记录)`;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.error = errorMsg;
+        this.progressMessage = "导出失败";
+        // 错误信息通过后端日志事件已经发送，这里只更新UI状态
+      } finally {
+        // 取消事件监听
+        unlisten();
+        this.loading = false;
+      }
+    },
+
+    async exportDemandResults(params: ExportDemandResultsParams): Promise<void> {
+      this.loading = true;
+      this.error = null;
+      this.progress = 0;
+      this.progressMessage = "准备导出...";
+      this.logs = [];
+      this.exportedRows = 0;
+      this.exportedPath = null;
+
+      // 监听实时日志事件（后端已经包含了时间戳和格式化的日志）
+      const unlisten = await listen<string>("query-log", (event) => {
+        // 后端已经包含了时间戳，直接添加
+        this.logs.push(event.payload);
+      });
+
+      try {
+        this.updateProgress(10, "开始导出...");
+        
+        const rowCount = await invoke<number>("export_demand_results_direct", { params });
         
         this.exportedRows = rowCount;
         this.exportedPath = params.outputPath;
