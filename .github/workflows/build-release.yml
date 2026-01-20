@@ -28,65 +28,35 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
-      - name: Build the app (installer)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: ./
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Remote Tool ${{ github.ref_name }}'
-          releaseBody: |
-            ## Remote Tool ${{ github.ref_name }}
-            
-            **Build Information:**
-            - Build Date: ${{ github.event.head_commit.timestamp }}
-            - Git Commit: ${{ github.sha }}
-            
-            **安装方式:**
-            
-            **方式 1：安装包（推荐）**
-            1. 下载 `remote-tool_*.exe` 安装包
-            2. 运行安装包进行安装
-            3. 从开始菜单启动应用
-            
-            **方式 2：便携版（免安装）**
-            1. 下载 `remote-tool-portable-*.zip` 压缩包
-            2. 解压到任意目录
-            3. 直接运行 `remote-tool.exe` 即可
-            
-            **功能:**
-            - 数据查询：通过SSH连接远程服务器查询SQLite数据库
-            - 应用部署：通过SSH部署应用程序到远程服务器
-            - 自动更新：支持从GitHub Releases自动更新
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-          updaterJsonPreferNsis: true
-          args: --target x86_64-pc-windows-msvc
+      - name: Build portable app
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+        shell: bash
 
-      - name: Collect files for portable package
+      - name: Package portable app
         shell: powershell
         run: |
           $targetDir = "src-tauri\target\x86_64-pc-windows-msvc\release"
           $exePath = "$targetDir\remote-tool.exe"
+          $zipName = "remote-tool-portable-${{ github.ref_name }}.zip"
+          
+          # 检查可执行文件是否存在
+          if (-not (Test-Path $exePath)) {
+            Write-Error "可执行文件不存在: $exePath"
+            exit 1
+          }
+          
+          Write-Host "找到可执行文件: remote-tool.exe"
+          $exeSize = [math]::Round((Get-Item $exePath).Length / 1MB, 2)
+          Write-Host "文件大小: $exeSize MB"
           
           # 创建临时目录用于打包
           $packageDir = "portable-package"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           
           # 复制可执行文件
-          if (Test-Path $exePath) {
-            Copy-Item $exePath $packageDir\remote-tool.exe
-            Write-Host "已复制可执行文件: remote-tool.exe"
-          } else {
-            Write-Error "可执行文件不存在: $exePath"
-            exit 1
-          }
+          Copy-Item $exePath "$packageDir\remote-tool.exe"
           
-          # 检查可执行文件目录中是否有其他 DLL（Tauri 可能会生成一些 DLL）
+          # 检查并复制依赖的 DLL 文件（如果有）
           $dllFiles = Get-ChildItem -Path $targetDir -Filter "*.dll" -ErrorAction SilentlyContinue
           if ($dllFiles) {
             foreach ($dll in $dllFiles) {
@@ -97,40 +67,44 @@ jobs:
             Write-Host "未发现额外的 DLL 文件（这是正常的，Rust 程序通常静态链接）"
           }
           
-          # 检查是否有其他必要的文件（如配置文件等）
-          $otherFiles = @("*.toml", "*.json", "*.yaml", "*.yml")
-          foreach ($pattern in $otherFiles) {
-            $files = Get-ChildItem -Path $targetDir -Filter $pattern -ErrorAction SilentlyContinue
-            if ($files) {
-              foreach ($file in $files) {
-                Copy-Item $file.FullName $packageDir\
-                Write-Host "已复制配置文件: $($file.Name)"
-              }
-            }
-          }
-          
-          Write-Host "`n打包文件列表:"
-          Get-ChildItem -Path $packageDir | ForEach-Object { 
-            $size = [math]::Round($_.Length / 1MB, 2)
-            Write-Host "  - $($_.Name) ($size MB)" 
-          }
-
-      - name: Create portable zip package
-        shell: powershell
-        run: |
-          $packageDir = "portable-package"
-          $zipName = "remote-tool-portable-${{ github.ref_name }}.zip"
-          
           # 创建压缩包
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
           
           $zipSize = [math]::Round((Get-Item $zipName).Length / 1MB, 2)
-          Write-Host "已创建压缩包: $zipName ($zipSize MB)"
+          Write-Host "已创建便携版压缩包: $zipName ($zipSize MB)"
+          
+          # 列出压缩包内容
+          Write-Host "`n压缩包内容:"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipName)
+          $zip.Entries | ForEach-Object { Write-Host "  - $($_.FullName)" }
+          $zip.Dispose()
+          
+          # 清理临时目录
+          Remove-Item -Path $packageDir -Recurse -Force
 
-      - name: Upload portable package to release
+      - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: remote-tool-portable-*.zip
           tag_name: ${{ github.ref_name }}
+          name: 'Remote Tool ${{ github.ref_name }}'
+          body: |
+            ## Remote Tool ${{ github.ref_name }}
+            
+            **Build Information:**
+            - Build Date: ${{ github.event.head_commit.timestamp }}
+            - Git Commit: ${{ github.sha }}
+            
+            **使用方式（便携版）:**
+            1. 下载 `remote-tool-portable-*.zip` 压缩包
+            2. 解压到任意目录
+            3. 直接运行 `remote-tool.exe` 即可（无需安装）
+            
+            **功能:**
+            - 数据查询：通过SSH连接远程服务器查询SQLite数据库
+            - 应用部署：通过SSH部署应用程序到远程服务器
+          files: remote-tool-portable-*.zip
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

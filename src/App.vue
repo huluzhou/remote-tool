@@ -3,11 +3,13 @@
     <header class="app-header">
       <h1>Remote Tool</h1>
       <div class="header-actions">
+        <!-- 更新按钮已隐藏，但保留代码逻辑用于后台自动检查更新 -->
         <button 
           @click="checkUpdate" 
           class="update-btn" 
           :class="{ 'update-available': updateAvailable }"
           :disabled="checkingUpdate"
+          style="display: none;"
         >
           {{ checkingUpdate ? '检查中...' : (updateAvailable ? '有可用更新' : '检查更新') }}
         </button>
