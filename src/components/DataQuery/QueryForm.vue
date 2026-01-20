@@ -1,7 +1,28 @@
 <template>
   <div class="query-form">
-    <h3>导出宽表数据</h3>
+    <h3>{{ queryType === 'wide_table' ? '导出宽表数据' : '导出需量数据' }}</h3>
     <form @submit.prevent="handleSubmit">
+      <div class="form-group">
+        <label>查询类型:</label>
+        <div class="radio-group">
+          <label>
+            <input
+              type="radio"
+              value="wide_table"
+              v-model="queryType"
+            />
+            宽表查询
+          </label>
+          <label>
+            <input
+              type="radio"
+              value="demand"
+              v-model="queryType"
+            />
+            需量查询
+          </label>
+        </div>
+      </div>
       <div class="form-group">
         <label>数据库路径:</label>
         <input
@@ -56,6 +77,8 @@ const emit = defineEmits<{
 
 const queryStore = useQueryStore();
 const loading = computed(() => queryStore.loading);
+
+const queryType = ref<"wide_table" | "demand">("wide_table");
 
 const formData = ref({
   dbPath: "/mnt/analysis/data/device_data.db",
@@ -129,6 +152,7 @@ const handleSubmit = () => {
   }
 
   const params = {
+    queryType: queryType.value,
     dbPath: formData.value.dbPath,
     startTime,
     endTime,
@@ -180,6 +204,12 @@ const handleSubmit = () => {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  cursor: pointer;
+  margin-bottom: 0;
+}
+
+.radio-group input[type="radio"] {
+  margin: 0;
   cursor: pointer;
 }
 

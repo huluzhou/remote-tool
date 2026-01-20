@@ -18,6 +18,7 @@ fn main() {
             commands::execute_query,
             commands::export_to_csv,
             commands::export_wide_table_direct,
+            commands::export_demand_results_direct,
             commands::check_deploy_status,
             commands::deploy_application,
         ])

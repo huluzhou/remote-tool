@@ -90,6 +90,11 @@ watch(() => queryStore.logs, () => {
 const handleQuery = async (params: any) => {
   // 先弹出文件保存对话框
   let filePath: string | null = null;
+  const queryType = params.queryType || "wide_table";
+  const defaultFileName = queryType === "demand" 
+    ? `demand_results_${Date.now()}.csv`
+    : `wide_table_${Date.now()}.csv`;
+  
   try {
     filePath = await save({
       filters: [
@@ -98,7 +103,7 @@ const handleQuery = async (params: any) => {
           extensions: ["csv"],
         },
       ],
-      defaultPath: `wide_table_${Date.now()}.csv`,
+      defaultPath: defaultFileName,
     });
   } catch (error) {
     console.error("保存对话框失败:", error);
@@ -110,13 +115,22 @@ const handleQuery = async (params: any) => {
     return;
   }
 
-  // 调用导出函数
-  await queryStore.exportWideTable({
-    dbPath: params.dbPath,
-    startTime: params.startTime,
-    endTime: params.endTime,
-    outputPath: filePath,
-  });
+  // 根据查询类型调用不同的导出函数
+  if (queryType === "demand") {
+    await queryStore.exportDemandResults({
+      dbPath: params.dbPath,
+      startTime: params.startTime,
+      endTime: params.endTime,
+      outputPath: filePath,
+    });
+  } else {
+    await queryStore.exportWideTable({
+      dbPath: params.dbPath,
+      startTime: params.startTime,
+      endTime: params.endTime,
+      outputPath: filePath,
+    });
+  }
 };
 
 </script>
