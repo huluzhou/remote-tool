@@ -283,9 +283,11 @@ except Exception as e:
     
     // 使用SFTP下载文件
     add_query_log(app_handle_ref, "下载文件...");
-    SshClient::download_file(remote_temp_file, &local_temp_path)
-        .await
-        .map_err(|e| format!("下载结果文件失败: {}", e))?;
+    if let Err(e) = SshClient::download_file(remote_temp_file, &local_temp_path).await {
+        // 下载失败时，清理临时文件
+        let _ = std::fs::remove_file(&local_temp_path);
+        return Err(format!("下载结果文件失败: {}", e));
+    }
     
     // 获取压缩文件大小
     let compressed_size = std::fs::metadata(&local_temp_path)
@@ -540,9 +542,11 @@ except Exception as e:
     
     // 使用SFTP下载文件
     add_query_log(app_handle_ref, "下载文件...");
-    SshClient::download_file(remote_temp_file, &local_temp_path)
-        .await
-        .map_err(|e| format!("下载结果文件失败: {}", e))?;
+    if let Err(e) = SshClient::download_file(remote_temp_file, &local_temp_path).await {
+        // 下载失败时，清理临时文件
+        let _ = std::fs::remove_file(&local_temp_path);
+        return Err(format!("下载结果文件失败: {}", e));
+    }
     
     // 获取压缩文件大小
     let compressed_size = std::fs::metadata(&local_temp_path)
@@ -742,9 +746,11 @@ except Exception as e:
     
     // 使用SFTP下载文件
     add_query_log(app_handle_ref, "下载查询结果...");
-    SshClient::download_file(remote_temp_file, &local_temp_path)
-        .await
-        .map_err(|e| format!("下载结果文件失败: {}", e))?;
+    if let Err(e) = SshClient::download_file(remote_temp_file, &local_temp_path).await {
+        // 下载失败时，清理临时文件
+        let _ = std::fs::remove_file(&local_temp_path);
+        return Err(format!("下载结果文件失败: {}", e));
+    }
     
     // 获取文件大小
     let file_size = std::fs::metadata(&local_temp_path)
