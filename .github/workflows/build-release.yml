@@ -1,11 +1,10 @@
 name: Build and Release
 
+# 触发：push 到 main（PR 合并后）自动 bump 版本、打 tag、构建并发布；workflow_dispatch 从 main 当前版本构建并发布（若该版本已有 Release 则会更新该 Release）。
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -16,6 +15,8 @@ jobs:
   bump-and-tag:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'chore(版本): 自动更新版本号')
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,11 +35,30 @@ jobs:
       - name: 获取并递增版本号
         id: bump
         run: |
+          # 仅支持 X.Y.Z 数字版本
           VERSION=$(node -p "require('./package.json').version")
           NEW_VERSION=$(node -e "const [a,b,c]=process.argv[1].split('.').map(Number); console.log(a+'.'+b+'.'+(c+1));" "$VERSION")
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "当前版本: $VERSION -> 新版本: $NEW_VERSION"
-          bash update-version.sh "$NEW_VERSION"
+
+      - name: 修改文件中的版本号
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new_version }}"
+          export NEW_VERSION
+          node -e "
+            const v = process.env.NEW_VERSION;
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = v;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+            const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            tauri.version = v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(tauri, null, 2));
+          "
+          # 仅支持根 [package] 下 version 单行
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
+          echo "已更新 package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml 版本号为 $NEW_VERSION"
+          grep -E '"version"|^version' package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
 
       - name: 提交版本更新
         run: |
@@ -51,24 +71,26 @@ jobs:
           git tag -a "v${{ steps.bump.outputs.new_version }}" -m "Release v${{ steps.bump.outputs.new_version }}"
           git push origin "v${{ steps.bump.outputs.new_version }}"
 
-  # 仅在 tag 推送时构建并发布（避免 push 到 main 时重复构建）
+  # PR 合并到 main 后：在 bump-and-tag 成功后构建并发布；或 workflow_dispatch 时构建
   build:
     runs-on: windows-latest
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: bump-and-tag
+    if: always() && (needs.bump-and-tag.result == 'success' || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.bump-and-tag.outputs.new_version && format('v{0}', needs.bump-and-tag.outputs.new_version) || github.ref }}
 
       - name: 确定 Tag 名称
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          NEW_VERSION="${{ needs.bump-and-tag.outputs.new_version || '' }}"
+          if [ -n "$NEW_VERSION" ]; then
+            echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
           else
-            TAG="v$(node -p "require('./package.json').version")"
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "tag=v$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
           fi
 
       - name: Setup Node.js
