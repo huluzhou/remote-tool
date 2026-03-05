@@ -1,6 +1,8 @@
 name: Build and Release
 
-# 触发：push 到 main（PR 合并后）自动 bump 版本、打 tag、构建并发布；workflow_dispatch 从 main 当前版本构建并发布（若该版本已有 Release 则会更新该 Release）。
+# 触发方式：
+# 1. push 到 main：自动 bump 版本、打 tag、构建并发布 Release
+# 2. workflow_dispatch（任意分支）：仅构建，产物上传为 Artifact（不创建 Release，避免覆盖正式版本）
 on:
   push:
     branches:
@@ -8,10 +10,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # 需要写入权限来创建 Release、上传文件、推送 tag 和提交
+  contents: write
 
 jobs:
-  # 仅在 push 到 main 时执行版本号更新和打 tag（跳过由 CI 自己推送的版本更新提交，避免无限循环）
   bump-and-tag:
     runs-on: ubuntu-latest
     if: "github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'chore(版本): 自动更新版本号')"
@@ -35,11 +36,28 @@ jobs:
       - name: 获取并递增版本号
         id: bump
         run: |
-          # 仅支持 X.Y.Z 数字版本
+          # 仅支持 X.Y.Z 数字版本。根据 Conventional Commits 判断 bump 类型：feat -> minor，fix/perf/refactor 等 -> patch，BREAKING CHANGE -> major
           VERSION=$(node -p "require('./package.json').version")
-          NEW_VERSION=$(node -e "const [a,b,c]=process.argv[1].split('.').map(Number); console.log(a+'.'+b+'.'+(c+1));" "$VERSION")
+          COMMITS=$(git log -1 --pretty=%B HEAD)
+          if echo "$COMMITS" | head -1 | grep -qE "^Merge (pull request|branch)"; then
+            COMMITS=$(git log --pretty=%B ${{ github.event.before }}..${{ github.sha }} 2>/dev/null | head -100 || git log -20 --pretty=%B)
+          fi
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qi "BREAKING CHANGE"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qE "^(feat|feat\([^)]*\)):"; then
+            BUMP="minor"
+          fi
+          NEW_VERSION=$(node -e "
+            const [a,b,c]=process.argv[1].split('.').map(Number);
+            const bump=process.argv[2];
+            if(bump==='major') console.log((a+1)+'.0.0');
+            else if(bump==='minor') console.log(a+'.'+(b+1)+'.0');
+            else console.log(a+'.'+b+'.'+(c+1));
+          " "$VERSION" "$BUMP")
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "当前版本: $VERSION -> 新版本: $NEW_VERSION"
+          echo "bump_type=$BUMP" >> $GITHUB_OUTPUT
+          echo "当前版本: $VERSION | bump: $BUMP -> 新版本: $NEW_VERSION"
 
       - name: 修改文件中的版本号
         run: |
@@ -71,7 +89,6 @@ jobs:
           git tag -a "v${{ steps.bump.outputs.new_version }}" -m "Release v${{ steps.bump.outputs.new_version }}"
           git push origin "v${{ steps.bump.outputs.new_version }}"
 
-  # PR 合并到 main 后：在 bump-and-tag 成功后构建并发布；或 workflow_dispatch 时构建
   build:
     runs-on: windows-latest
     needs: bump-and-tag
@@ -82,15 +99,21 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.bump-and-tag.outputs.new_version && format('v{0}', needs.bump-and-tag.outputs.new_version) || github.ref }}
 
-      - name: 确定 Tag 名称
+      - name: 确定构建标识
         id: tag
         shell: bash
         run: |
           NEW_VERSION="${{ needs.bump-and-tag.outputs.new_version || '' }}"
           if [ -n "$NEW_VERSION" ]; then
             echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "is_release=true" >> $GITHUB_OUTPUT
           else
-            echo "tag=v$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+            # workflow_dispatch：用版本号+分支名+短SHA，避免与正式版本冲突
+            VERSION=$(node -p "require('./package.json').version")
+            BRANCH="${GITHUB_REF_NAME}"
+            SHORT_SHA="${GITHUB_SHA:0:7}"
+            echo "tag=v${VERSION}-${BRANCH}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Setup Node.js
@@ -145,7 +168,16 @@ jobs:
           
           Remove-Item -Path $packageDir -Recurse -Force
 
-      - name: Create Release
+      - name: 上传构建产物（Artifact）
+        if: steps.tag.outputs.is_release == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-tool-portable-${{ steps.tag.outputs.tag }}
+          path: remote-tool-portable-*.zip
+          retention-days: 7
+
+      - name: 创建 Release
+        if: steps.tag.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
