@@ -15,32 +15,9 @@ pub struct SshClient;
 
 static SSH_CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 static SSH_CONFIG: Mutex<Option<SshConfig>> = Mutex::new(None);
-// 日志回调函数：用于将SSH日志发送到查询日志
-static LOG_CALLBACK: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>> = Mutex::new(None);
-
 impl SshClient {
-    /// 设置日志回调函数（用于将SSH日志发送到查询日志）
-    pub fn set_log_callback<F>(callback: F)
-    where
-        F: Fn(&str) + Send + Sync + 'static,
-    {
-        *LOG_CALLBACK.lock().unwrap() = Some(Arc::new(callback));
-    }
-
-    /// 清除日志回调函数
-    pub fn clear_log_callback() {
-        *LOG_CALLBACK.lock().unwrap() = None;
-    }
-
-    /// 发送日志（如果设置了回调函数，则调用回调；否则只输出到控制台）
     fn log(message: &str) {
-        // 如果设置了回调函数，调用它（回调函数会负责发送到前端和控制台）
-        if let Some(callback) = LOG_CALLBACK.lock().unwrap().as_ref() {
-            callback(message);
-        } else {
-            // 如果没有设置回调，只输出到控制台
-            eprintln!("{}", message);
-        }
+        eprintln!("{}", message);
     }
 
     /// 连接到 SSH 服务器（类似 paramiko 的连接方式，针对 JumpServer 优化）
