@@ -49,7 +49,6 @@ pub async fn sync_database(
         .map_err(|e| format!("执行远程备份命令失败: {}", e))?;
 
     if exit_code != 0 {
-        // sqlite3 不可用或失败，回退到 cp
         let is_not_found = stderr.to_lowercase().contains("command not found")
             || stderr.to_lowercase().contains("not found");
         if is_not_found {
@@ -65,6 +64,31 @@ pub async fn sync_database(
             return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
         }
     }
+
+    // 验证远程临时文件确实存在并获取大小
+    let verify_cmd = format!("ls -l \"{}\" 2>&1", remote_tmp);
+    let (verify_exit, verify_stdout, _) = SshClient::execute_command(&verify_cmd)
+        .await
+        .map_err(|e| format!("验证远程文件失败: {}", e))?;
+    if verify_exit != 0 || verify_stdout.contains("No such file") {
+        // backup 声称成功但文件不存在，直接用 cp 重试
+        add_query_log(app_handle_ref, "备份文件未生成，使用 cp 重试...");
+        let cp_cmd = format!("cp \"{}\" \"{}\"", db_path, remote_tmp);
+        let (cp_exit, _, cp_stderr) = SshClient::execute_command(&cp_cmd)
+            .await
+            .map_err(|e| format!("执行远程复制命令失败: {}", e))?;
+        if cp_exit != 0 {
+            return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
+        }
+        // 再次验证
+        let (v2_exit, v2_stdout, _) = SshClient::execute_command(&verify_cmd)
+            .await
+            .map_err(|e| format!("验证远程文件失败: {}", e))?;
+        if v2_exit != 0 || v2_stdout.contains("No such file") {
+            return Err(format!("远程数据库文件无法创建。ls 输出: {}", v2_stdout.trim()));
+        }
+    }
+    add_query_log(app_handle_ref, &format!("远程文件就绪: {}", verify_stdout.trim()));
 
     // 本地临时目录
     let local_dir = std::env::temp_dir();
