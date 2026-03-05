@@ -6,8 +6,6 @@ use uuid::Uuid;
 use chrono::{Utc, FixedOffset, TimeZone};
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
-use std::io::BufReader;
-use flate2::read::GzDecoder;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,16 +109,14 @@ pub async fn export_wide_table_direct(
     // 将参数进行base64编码，避免shell注入
     let db_path_b64 = general_purpose::STANDARD.encode(db_path.as_bytes());
     
-    // 创建远程临时文件路径（CSV+Gzip格式，最高压缩级别）
+    // 创建远程临时文件路径（CSV格式）
     let mut uuid_buffer = [0u8; 32];
-    let temp_file = format!("/tmp/wide_table_export_{}.csv.gz", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
+    let temp_file = format!("/tmp/wide_table_export_{}.csv", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
     
-    // 创建Python脚本来执行流式查询和压缩
-    // 使用gzip最快压缩级别（compresslevel=1）和流式处理（fetchmany），降低嵌入式设备CPU负载
+    // 创建Python脚本来执行流式查询
     let python_script = format!(r#"
 import sqlite3
 import csv
-import gzip
 import sys
 import base64
 import os
@@ -181,19 +177,19 @@ try:
     
     if not columns:
         # 如果没有列，创建空文件
-        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as f:
+        with open(temp_file, 'w', encoding='utf-8', newline='') as f:
             pass
         print(json.dumps({{"file": temp_file, "rows": 0}}))
         conn.close()
         sys.exit(0)
     
-    # 流式写入CSV到临时文件并压缩（最快压缩级别，降低CPU负载）
+    # 流式写入CSV到临时文件
     # 使用fetchmany分批读取，避免一次性加载所有数据到内存
     row_count = 0
     batch_size = 5000  # 每批处理5000行
     
-    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as gz_file:
-        writer = csv.writer(gz_file, quoting=csv.QUOTE_NONNUMERIC)
+    with open(temp_file, 'w', encoding='utf-8', newline='') as csv_file:
+        writer = csv.writer(csv_file, quoting=csv.QUOTE_NONNUMERIC)
         writer.writerow(columns)
         
         # 分批读取数据
@@ -230,7 +226,7 @@ except Exception as e:
     sys.exit(1)
 "#, db_path_b64, temp_file, start_time, end_time);
     
-    add_query_log(app_handle_ref, "执行查询并压缩数据...");
+    add_query_log(app_handle_ref, "执行查询...");
     
     // 使用heredoc方式执行Python脚本
     let mut eof_uuid_buffer = [0u8; 32];
@@ -275,7 +271,7 @@ except Exception as e:
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     
-    // 创建本地临时文件（用于下载压缩文件）
+    // 创建本地临时文件（用于下载CSV文件）
     let local_temp_file = NamedTempFile::new()
         .map_err(|e| format!("创建本地临时文件失败: {}", e))?;
     let local_temp_path = local_temp_file.path().to_string_lossy().to_string();
@@ -288,22 +284,21 @@ except Exception as e:
         return Err(format!("下载结果文件失败: {}", e));
     }
     
-    // 获取压缩文件大小
-    let compressed_size = std::fs::metadata(&local_temp_path)
+    // 获取下载的CSV文件大小
+    let file_size = std::fs::metadata(&local_temp_path)
         .map_err(|e| format!("获取文件信息失败: {}", e))?
         .len();
     
     // 清理远程临时文件
     let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
     
-    // 流式解压并直接写入目标CSV文件（不加载到内存）
+    // 从下载的CSV文件直接复制到目标文件（带UTF-8 BOM）
     {
         use std::io::{Read, Write};
         
-        // 打开压缩文件
-        let file = std::fs::File::open(&local_temp_path)
-            .map_err(|e| format!("打开压缩文件失败: {}", e))?;
-        let decoder = GzDecoder::new(file);
+        // 打开下载的CSV文件
+        let mut src_file = std::fs::File::open(&local_temp_path)
+            .map_err(|e| format!("打开CSV文件失败: {}", e))?;
         
         // 创建目标CSV文件（带UTF-8 BOM，Excel兼容）
         let mut output_file = std::fs::File::create(&output_path)
@@ -313,12 +308,11 @@ except Exception as e:
         output_file.write_all(&[0xEF, 0xBB, 0xBF])
             .map_err(|e| format!("写入BOM失败: {}", e))?;
         
-        // 流式复制：从解压器直接写入目标文件
-        let mut decoder_reader = BufReader::new(decoder);
+        // 流式复制：从源文件直接写入目标文件
         let mut buffer = [0u8; 8192]; // 8KB缓冲区
         loop {
-            let bytes_read = decoder_reader.read(&mut buffer)
-                .map_err(|e| format!("读取解压数据失败: {}", e))?;
+            let bytes_read = src_file.read(&mut buffer)
+                .map_err(|e| format!("读取CSV数据失败: {}", e))?;
             if bytes_read == 0 {
                 break;
             }
@@ -333,16 +327,10 @@ except Exception as e:
     // 清理本地临时文件
     let _ = std::fs::remove_file(&local_temp_path);
     
-    // 获取最终文件大小
-    let final_size = std::fs::metadata(&output_path)
-        .map_err(|e| format!("获取输出文件信息失败: {}", e))?
-        .len();
-    
     // 合并最终信息为一条日志
-    add_query_log(app_handle_ref, &format!("导出完成 | {} 条记录 | 压缩: {:.2}MB | 解压: {:.2}MB", 
+    add_query_log(app_handle_ref, &format!("导出完成 | {} 条记录 | 文件大小: {:.2}MB", 
         row_count, 
-        compressed_size as f64 / 1024.0 / 1024.0,
-        final_size as f64 / 1024.0 / 1024.0));
+        file_size as f64 / 1024.0 / 1024.0));
     
     // 清除SSH日志回调
     crate::ssh::SshClient::clear_log_callback();
@@ -390,16 +378,14 @@ pub async fn export_demand_results_direct(
     // 将参数进行base64编码，避免shell注入
     let db_path_b64 = general_purpose::STANDARD.encode(db_path.as_bytes());
     
-    // 创建远程临时文件路径（CSV+Gzip格式，最快压缩级别）
+    // 创建远程临时文件路径（CSV格式）
     let mut uuid_buffer = [0u8; 32];
-    let temp_file = format!("/tmp/demand_results_export_{}.csv.gz", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
+    let temp_file = format!("/tmp/demand_results_export_{}.csv", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
     
-    // 创建Python脚本来执行流式查询和压缩
-    // 使用gzip最快压缩级别（compresslevel=1）和流式处理（fetchmany），降低嵌入式设备CPU负载
+    // 创建Python脚本来执行流式查询
     let python_script = format!(r#"
 import sqlite3
 import csv
-import gzip
 import sys
 import base64
 import os
@@ -456,13 +442,13 @@ try:
     # 定义列名
     columns = ['id', 'timestamp', 'meter_sn', 'calculated_demand']
     
-    # 流式写入CSV到临时文件并压缩（最快压缩级别，降低CPU负载）
+    # 流式写入CSV到临时文件
     # 使用fetchmany分批读取，避免一次性加载所有数据到内存
     row_count = 0
     batch_size = 5000  # 每批处理5000行
     
-    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as gz_file:
-        writer = csv.writer(gz_file, quoting=csv.QUOTE_NONNUMERIC)
+    with open(temp_file, 'w', encoding='utf-8', newline='') as csv_file:
+        writer = csv.writer(csv_file, quoting=csv.QUOTE_NONNUMERIC)
         writer.writerow(columns)
         
         # 分批读取数据
@@ -492,7 +478,7 @@ except Exception as e:
     sys.exit(1)
 "#, db_path_b64, temp_file, start_time, end_time);
     
-    add_query_log(app_handle_ref, "执行查询并压缩数据...");
+    add_query_log(app_handle_ref, "执行查询...");
     
     // 使用heredoc方式执行Python脚本
     let mut eof_uuid_buffer = [0u8; 32];
@@ -537,7 +523,7 @@ except Exception as e:
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     
-    // 创建本地临时文件（用于下载压缩文件）
+    // 创建本地临时文件（用于下载CSV文件）
     let local_temp_file = NamedTempFile::new()
         .map_err(|e| format!("创建本地临时文件失败: {}", e))?;
     let local_temp_path = local_temp_file.path().to_string_lossy().to_string();
@@ -550,22 +536,21 @@ except Exception as e:
         return Err(format!("下载结果文件失败: {}", e));
     }
     
-    // 获取压缩文件大小
-    let compressed_size = std::fs::metadata(&local_temp_path)
+    // 获取下载的CSV文件大小
+    let file_size = std::fs::metadata(&local_temp_path)
         .map_err(|e| format!("获取文件信息失败: {}", e))?
         .len();
     
     // 清理远程临时文件
     let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
     
-    // 流式解压并直接写入目标CSV文件（不加载到内存）
+    // 从下载的CSV文件直接复制到目标文件（带UTF-8 BOM）
     {
         use std::io::{Read, Write};
         
-        // 打开压缩文件
-        let file = std::fs::File::open(&local_temp_path)
-            .map_err(|e| format!("打开压缩文件失败: {}", e))?;
-        let decoder = GzDecoder::new(file);
+        // 打开下载的CSV文件
+        let mut src_file = std::fs::File::open(&local_temp_path)
+            .map_err(|e| format!("打开CSV文件失败: {}", e))?;
         
         // 创建目标CSV文件（带UTF-8 BOM，Excel兼容）
         let mut output_file = std::fs::File::create(&output_path)
@@ -575,12 +560,11 @@ except Exception as e:
         output_file.write_all(&[0xEF, 0xBB, 0xBF])
             .map_err(|e| format!("写入BOM失败: {}", e))?;
         
-        // 流式复制：从解压器直接写入目标文件
-        let mut decoder_reader = BufReader::new(decoder);
+        // 流式复制：从源文件直接写入目标文件
         let mut buffer = [0u8; 8192]; // 8KB缓冲区
         loop {
-            let bytes_read = decoder_reader.read(&mut buffer)
-                .map_err(|e| format!("读取解压数据失败: {}", e))?;
+            let bytes_read = src_file.read(&mut buffer)
+                .map_err(|e| format!("读取CSV数据失败: {}", e))?;
             if bytes_read == 0 {
                 break;
             }
@@ -595,16 +579,10 @@ except Exception as e:
     // 清理本地临时文件
     let _ = std::fs::remove_file(&local_temp_path);
     
-    // 获取最终文件大小
-    let final_size = std::fs::metadata(&output_path)
-        .map_err(|e| format!("获取输出文件信息失败: {}", e))?
-        .len();
-    
     // 合并最终信息为一条日志
-    add_query_log(app_handle_ref, &format!("导出完成 | {} 条记录 | 压缩: {:.2}MB | 解压: {:.2}MB", 
+    add_query_log(app_handle_ref, &format!("导出完成 | {} 条记录 | 文件大小: {:.2}MB", 
         row_count, 
-        compressed_size as f64 / 1024.0 / 1024.0,
-        final_size as f64 / 1024.0 / 1024.0));
+        file_size as f64 / 1024.0 / 1024.0));
     
     // 清除SSH日志回调
     crate::ssh::SshClient::clear_log_callback();
@@ -639,15 +617,14 @@ async fn execute_sql_query(db_path: &str, sql: &str, app_handle: Option<&tauri::
     let sql_b64 = general_purpose::STANDARD.encode(sql.as_bytes());
     let db_path_b64 = general_purpose::STANDARD.encode(db_path.as_bytes());
     
-    // 创建临时文件路径（CSV+Gzip格式）
+    // 创建临时文件路径（CSV格式）
     let mut uuid_buffer = [0u8; 32];
-    let temp_file = format!("/tmp/query_result_{}.csv.gz", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
+    let temp_file = format!("/tmp/query_result_{}.csv", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
     
     // 创建Python脚本来执行查询
     let python_script = format!(r#"
 import sqlite3
 import csv
-import gzip
 import sys
 import base64
 import os
@@ -672,15 +649,15 @@ try:
     
     if not columns:
         # 如果没有列，创建空文件
-        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as f:
+        with open(temp_file, 'w', encoding='utf-8', newline='') as f:
             pass
         print(temp_file)
         conn.close()
         sys.exit(0)
     
-    # 将CSV写入临时文件并压缩（最快压缩级别），避免stdout缓冲区限制
-    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as gz_file:
-        writer = csv.writer(gz_file)
+    # 将CSV写入临时文件，避免stdout缓冲区限制
+    with open(temp_file, 'w', encoding='utf-8', newline='') as csv_file:
+        writer = csv.writer(csv_file)
         writer.writerow(columns)
         
         batch_size = 5000
@@ -738,7 +715,7 @@ except Exception as e:
     // 从stdout获取远程临时文件路径
     let remote_temp_file = stdout.trim();
     
-    // 创建本地临时文件（二进制模式，用于gzip文件）
+    // 创建本地临时文件（用于下载CSV文件）
     let local_temp_file = NamedTempFile::new()
         .map_err(|e| format!("创建本地临时文件失败: {}", e))?;
     let local_temp_path = local_temp_file.path().to_string_lossy().to_string();
@@ -759,22 +736,9 @@ except Exception as e:
     // 清理远程临时文件
     let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_temp_file)).await;
     
-    // 解压CSV+Gzip文件并读取到内存（不保存到磁盘）
-    let csv_content = {
-        // 打开gzip文件并解压
-        let file = std::fs::File::open(&local_temp_path)
-            .map_err(|e| format!("打开压缩文件失败: {}", e))?;
-        let decoder = GzDecoder::new(file);
-        
-        // 将解压后的内容读取到内存
-        use std::io::Read;
-        let mut decoder_reader = BufReader::new(decoder);
-        let mut csv_content = Vec::new();
-        decoder_reader.read_to_end(&mut csv_content)
-            .map_err(|e| format!("读取解压数据失败: {}", e))?;
-        
-        csv_content
-    };
+    // 直接读取下载的CSV文件内容到内存
+    let csv_content = std::fs::read(&local_temp_path)
+        .map_err(|e| format!("读取CSV文件失败: {}", e))?;
     
     // 数据已读取到内存，可以删除临时文件了
     let _ = std::fs::remove_file(&local_temp_path);
