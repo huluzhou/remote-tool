@@ -69,13 +69,19 @@ pub async fn sync_database(
     // 本地临时目录
     let local_dir = std::env::temp_dir();
     let local_filename = format!("remote_tool_cache_{}.db", uuid_str);
-    let local_path = local_dir.join(&local_filename).to_string_lossy().to_string();
+    let local_path = local_dir.join(&local_filename);
+    let local_path_str = local_path.to_string_lossy().to_string();
 
-    // SFTP 下载
+    // SFTP 下载（Windows 下使用正斜杠路径，避免部分 SFTP 实现对反斜杠处理异常）
     add_query_log(app_handle_ref, "通过 SFTP 下载数据库文件...");
-    SshClient::download_file(&remote_tmp, &local_path)
+    let download_path = if cfg!(windows) {
+        local_path_str.replace('\\', "/")
+    } else {
+        local_path_str.clone()
+    };
+    SshClient::download_file(&remote_tmp, &download_path)
         .await
-        .map_err(|e| format!("下载数据库文件失败: {}", e))?;
+        .map_err(|e| format!("下载数据库文件失败: {}（原始错误: {}）", local_path_str, e))?;
 
     // 验证下载的文件
     let file_size = std::fs::metadata(&local_path)
@@ -94,14 +100,14 @@ pub async fn sync_database(
             let _ = std::fs::remove_file(&old.local_path);
         }
         cache.insert(db_path.clone(), CachedDb {
-            local_path: local_path.clone(),
+            local_path: local_path_str.clone(),
             remote_path: db_path.clone(),
             synced_at: Utc::now(),
         });
     }
 
     add_query_log(app_handle_ref, "数据库同步完成");
-    Ok(local_path)
+    Ok(local_path_str)
 }
 
 /// 获取已缓存的数据库本地路径

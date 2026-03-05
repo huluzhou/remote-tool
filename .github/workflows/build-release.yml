@@ -166,15 +166,13 @@ jobs:
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
           $zipSize = [math]::Round((Get-Item $zipName).Length / 1MB, 2)
           Write-Host "Created portable package: $zipName ($zipSize MB)"
-          
-          Remove-Item -Path $packageDir -Recurse -Force
 
       - name: 上传构建产物（Artifact）
         if: steps.tag.outputs.is_release == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: remote-tool-portable-${{ steps.tag.outputs.tag }}
-          path: remote-tool-portable-*.zip
+          path: portable-package/
           retention-days: 7
 
       - name: 创建 Release
