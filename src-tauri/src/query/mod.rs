@@ -116,7 +116,7 @@ pub async fn export_wide_table_direct(
     let temp_file = format!("/tmp/wide_table_export_{}.csv.gz", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
     
     // 创建Python脚本来执行流式查询和压缩
-    // 使用gzip最高压缩级别（compresslevel=9）和流式处理（fetchmany）
+    // 使用gzip最快压缩级别（compresslevel=1）和流式处理（fetchmany），降低嵌入式设备CPU负载
     let python_script = format!(r#"
 import sqlite3
 import csv
@@ -165,6 +165,13 @@ try:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
+    # 检查 data_wide 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='data_wide'")
+    if not cursor.fetchone():
+        error_msg = json.dumps({{"error": "数据库中不存在 data_wide 表"}}, ensure_ascii=False)
+        print(error_msg, file=sys.stderr)
+        sys.exit(1)
+    
     # 执行查询（使用参数化查询避免SQL注入）
     sql = "SELECT * FROM data_wide WHERE local_timestamp >= ? AND local_timestamp <= ? ORDER BY local_timestamp"
     cursor.execute(sql, (start_time_ms, end_time_ms))
@@ -174,22 +181,20 @@ try:
     
     if not columns:
         # 如果没有列，创建空文件
-        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=9) as f:
+        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as f:
             pass
         print(json.dumps({{"file": temp_file, "rows": 0}}))
         conn.close()
         sys.exit(0)
     
-    # 流式写入CSV到临时文件并压缩（最高压缩级别）
+    # 流式写入CSV到临时文件并压缩（最快压缩级别，降低CPU负载）
     # 使用fetchmany分批读取，避免一次性加载所有数据到内存
     row_count = 0
-    batch_size = 1000  # 每批处理1000行
+    batch_size = 5000  # 每批处理5000行
     
-    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=9) as gz_file:
-        # 配置CSV writer使用QUOTE_NONNUMERIC，确保非数字值（包括时间字符串）都被引号括起来
-        # 这样可以确保Excel正确识别文本值，不会尝试解析为时间类型
-        writer = csv.DictWriter(gz_file, fieldnames=columns, extrasaction='ignore', quoting=csv.QUOTE_NONNUMERIC)
-        writer.writeheader()
+    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as gz_file:
+        writer = csv.writer(gz_file, quoting=csv.QUOTE_NONNUMERIC)
+        writer.writerow(columns)
         
         # 分批读取数据
         while True:
@@ -198,25 +203,19 @@ try:
                 break
             
             for row in rows:
-                row_dict = {{}}
+                row_data = []
                 for i, col in enumerate(columns):
                     value = row[i]
-                    # 处理None值，转换为空字符串（CSV标准）
                     if value is None:
-                        row_dict[col] = ''
+                        row_data.append('')
                     elif col == 'local_timestamp':
-                        # 将local_timestamp列从毫秒时间戳转换为可读时间格式
-                        # 注意：由于使用QUOTE_NONNUMERIC，字符串值会自动被引号括起来
-                        row_dict[col] = format_timestamp_ms(value)
+                        row_data.append(format_timestamp_ms(value))
                     else:
-                        # 转换为字符串（CSV只支持字符串）
-                        # 如果是数字，保持为数字类型（不会被引号括起来）
-                        # 如果是字符串，会被引号括起来
                         if isinstance(value, (int, float)):
-                            row_dict[col] = value
+                            row_data.append(value)
                         else:
-                            row_dict[col] = str(value)
-                writer.writerow(row_dict)
+                            row_data.append(str(value))
+                writer.writerow(row_data)
                 row_count += 1
     
     # 输出临时文件路径和行数
