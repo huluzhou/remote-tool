@@ -109,8 +109,9 @@ jobs:
             echo "is_release=true" >> $GITHUB_OUTPUT
           else
             # workflow_dispatch：用版本号+分支名+短SHA，避免与正式版本冲突
+            # 分支名中的 / 替换为 -，否则 Windows 下 zip 路径非法
             VERSION=$(node -p "require('./package.json').version")
-            BRANCH="${GITHUB_REF_NAME}"
+            BRANCH="${GITHUB_REF_NAME//\//-}"
             SHORT_SHA="${GITHUB_SHA:0:7}"
             echo "tag=v${VERSION}-${BRANCH}-${SHORT_SHA}" >> $GITHUB_OUTPUT
             echo "is_release=false" >> $GITHUB_OUTPUT
