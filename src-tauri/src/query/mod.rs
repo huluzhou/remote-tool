@@ -672,28 +672,25 @@ try:
     
     if not columns:
         # 如果没有列，创建空文件
-        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=9) as f:
+        with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as f:
             pass
         print(temp_file)
         conn.close()
         sys.exit(0)
     
-    # 将CSV写入临时文件并压缩（最高压缩级别），避免stdout缓冲区限制
-    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=9) as gz_file:
-        writer = csv.DictWriter(gz_file, fieldnames=columns, extrasaction='ignore')
-        writer.writeheader()
+    # 将CSV写入临时文件并压缩（最快压缩级别），避免stdout缓冲区限制
+    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as gz_file:
+        writer = csv.writer(gz_file)
+        writer.writerow(columns)
         
-        for row in cursor.fetchall():
-            row_dict = {{}}
-            for i, col in enumerate(columns):
-                value = row[i]
-                # 处理None值，转换为空字符串（CSV标准）
-                if value is None:
-                    row_dict[col] = ''
-                else:
-                    # 转换为字符串（CSV只支持字符串）
-                    row_dict[col] = str(value)
-            writer.writerow(row_dict)
+        batch_size = 5000
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                row_data = [row[i] if row[i] is not None else '' for i in range(len(columns))]
+                writer.writerow(row_data)
     
     # 输出临时文件路径
     print(temp_file)
