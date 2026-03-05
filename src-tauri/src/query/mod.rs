@@ -72,16 +72,11 @@ pub async fn sync_database(
     let local_path = local_dir.join(&local_filename);
     let local_path_str = local_path.to_string_lossy().to_string();
 
-    // SFTP 下载（Windows 下使用正斜杠路径，避免部分 SFTP 实现对反斜杠处理异常）
+    // SFTP 流式下载（分块读写，不加载整个文件到内存）
     add_query_log(app_handle_ref, "通过 SFTP 下载数据库文件...");
-    let download_path = if cfg!(windows) {
-        local_path_str.replace('\\', "/")
-    } else {
-        local_path_str.clone()
-    };
-    SshClient::download_file(&remote_tmp, &download_path)
+    SshClient::download_file(&remote_tmp, &local_path_str)
         .await
-        .map_err(|e| format!("下载数据库文件失败: {}（原始错误: {}）", local_path_str, e))?;
+        .map_err(|e| format!("下载数据库文件失败: {}", e))?;
 
     // 验证下载的文件
     let file_size = std::fs::metadata(&local_path)

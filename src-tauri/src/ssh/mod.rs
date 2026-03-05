@@ -146,31 +146,66 @@ impl SshClient {
         Ok(())
     }
 
-    /// 从远程服务器下载文件（使用 SFTP，类似 paramiko 的 get）
+    /// 从远程服务器下载文件（流式 SFTP，分块读写，不将整个文件加载到内存）
     pub async fn download_file(remote_path: &str, local_path: &str) -> Result<()> {
-        use tokio::time::{timeout, Duration};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use russh_sftp::{client::SftpSession, protocol::OpenFlags};
         
         let client = Self::get_client()?;
         
-        // 记录下载开始时间
         let start_time = std::time::Instant::now();
         Self::log(&format!("[SFTP] 开始下载文件: {} -> {}", remote_path, local_path));
         
-        // 添加超时机制（60分钟，对于大文件足够）
-        let download_future = client.download_file(remote_path, local_path);
-        match timeout(Duration::from_secs(60*60), download_future).await {
-            Ok(Ok(_)) => {
-                // 记录下载耗时
-                let elapsed = start_time.elapsed();
-                Self::log(&format!("[SFTP] 文件下载完成，耗时: {:.2}秒", elapsed.as_secs_f64()));
-                Ok(())
+        // 建立 SFTP 会话
+        let channel = client.get_channel().await
+            .with_context(|| "建立SFTP通道失败")?;
+        channel.request_subsystem(true, "sftp").await
+            .with_context(|| "请求SFTP子系统失败")?;
+        let sftp = SftpSession::new(channel.into_stream()).await
+            .with_context(|| "创建SFTP会话失败")?;
+        
+        // 打开远程文件
+        let mut remote_file = sftp.open_with_flags(remote_path, OpenFlags::READ).await
+            .with_context(|| format!("打开远程文件失败: {}", remote_path))?;
+        
+        // 创建本地文件
+        let mut local_file = tokio::fs::File::create(local_path).await
+            .with_context(|| format!("创建本地文件失败: {}", local_path))?;
+        
+        // 分块读写（256KB 缓冲区，平衡内存和性能）
+        let mut total_bytes: u64 = 0;
+        let mut last_log_bytes: u64 = 0;
+        let mut buf = vec![0u8; 256 * 1024];
+        
+        loop {
+            let n = remote_file.read(&mut buf).await
+                .with_context(|| "读取远程文件数据失败")?;
+            if n == 0 {
+                break;
             }
-            Ok(Err(e)) => {
-                Err(e).with_context(|| format!("下载文件失败: {} -> {}", remote_path, local_path))
-            }
-            Err(_) => {
-                Err(anyhow::anyhow!("下载文件超时（超过60分钟）: {} -> {}", remote_path, local_path))
+            local_file.write_all(&buf[..n]).await
+                .with_context(|| "写入本地文件失败")?;
+            total_bytes += n as u64;
+            
+            // 每 10MB 记录一次进度
+            if total_bytes - last_log_bytes >= 10 * 1024 * 1024 {
+                Self::log(&format!("[SFTP] 已下载: {:.1}MB", total_bytes as f64 / 1024.0 / 1024.0));
+                last_log_bytes = total_bytes;
             }
         }
+        
+        local_file.flush().await
+            .with_context(|| "刷新本地文件失败")?;
+        
+        let elapsed = start_time.elapsed();
+        let speed = if elapsed.as_secs_f64() > 0.0 {
+            total_bytes as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        Self::log(&format!("[SFTP] 文件下载完成 | {:.2}MB | 耗时: {:.1}秒 | 速度: {:.1}MB/s", 
+            total_bytes as f64 / 1024.0 / 1024.0, elapsed.as_secs_f64(), speed));
+        
+        Ok(())
     }
 }
