@@ -32,6 +32,19 @@
           required
         />
       </div>
+      <div class="form-group sync-group">
+        <button
+          type="button"
+          class="sync-btn"
+          :disabled="syncing || !sshConnected"
+          @click="handleSync"
+        >
+          {{ syncing ? '同步中...' : '同步数据库' }}
+        </button>
+        <span class="sync-status" :class="{ synced: queryStore.dbSynced }">
+          {{ queryStore.dbSynced ? `已同步 (${queryStore.dbSyncTime})` : '未同步' }}
+        </span>
+      </div>
       <div class="form-group">
         <label>开始时间:</label>
         <div class="time-input-group">
@@ -68,15 +81,24 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed } from "vue";
 import { useQueryStore } from "../../stores/query";
+import { useSshStore } from "../../stores/ssh";
 
 const emit = defineEmits<{
   query: [params: any];
 }>();
 
 const queryStore = useQueryStore();
+const sshStore = useSshStore();
 const loading = computed(() => queryStore.loading);
+const syncing = computed(() => queryStore.syncing);
+const sshConnected = computed(() => sshStore.isConnected);
+
+const handleSync = () => {
+  if (syncing.value || !sshConnected.value) return;
+  queryStore.syncDatabase(formData.value.dbPath);
+};
 
 const queryType = ref<"wide_table" | "demand">("wide_table");
 
@@ -232,6 +254,44 @@ const handleSubmit = () => {
   padding: 0.5rem 1rem;
   font-size: 0.875rem;
   background-color: rgba(255, 255, 255, 0.1);
+}
+
+.sync-group {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.sync-btn {
+  padding: 0.5rem 1.25rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #4caf50;
+  background-color: rgba(76, 175, 80, 0.1);
+  border: 1px solid rgba(76, 175, 80, 0.4);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s, border-color 0.2s;
+  white-space: nowrap;
+}
+
+.sync-btn:hover:not(:disabled) {
+  background-color: rgba(76, 175, 80, 0.2);
+  border-color: rgba(76, 175, 80, 0.6);
+}
+
+.sync-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sync-status {
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.sync-status.synced {
+  color: #4caf50;
 }
 
 .submit-btn {

@@ -1,19 +1,121 @@
 name: Build and Release
 
+# 触发方式：
+# 1. push 到 main：自动 bump 版本、打 tag、构建并发布 Release
+# 2. workflow_dispatch（任意分支）：仅构建，产物上传为 Artifact（不创建 Release，避免覆盖正式版本）
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
-  contents: write  # 需要写入权限来创建 Release 和上传文件
+  contents: write
 
 jobs:
-  build:
-    runs-on: windows-latest
+  bump-and-tag:
+    runs-on: ubuntu-latest
+    if: "github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'chore(版本): 自动更新版本号')"
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 获取并递增版本号
+        id: bump
+        run: |
+          # 仅支持 X.Y.Z 数字版本。根据 Conventional Commits 判断 bump 类型：feat -> minor，fix/perf/refactor 等 -> patch，BREAKING CHANGE -> major
+          VERSION=$(node -p "require('./package.json').version")
+          COMMITS=$(git log -1 --pretty=%B HEAD)
+          if echo "$COMMITS" | head -1 | grep -qE "^Merge (pull request|branch)"; then
+            COMMITS=$(git log --pretty=%B ${{ github.event.before }}..${{ github.sha }} 2>/dev/null | head -100 || git log -20 --pretty=%B)
+          fi
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qi "BREAKING CHANGE"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qE "^(feat|feat\([^)]*\)):"; then
+            BUMP="minor"
+          fi
+          NEW_VERSION=$(node -e "
+            const [a,b,c]=process.argv[1].split('.').map(Number);
+            const bump=process.argv[2];
+            if(bump==='major') console.log((a+1)+'.0.0');
+            else if(bump==='minor') console.log(a+'.'+(b+1)+'.0');
+            else console.log(a+'.'+b+'.'+(c+1));
+          " "$VERSION" "$BUMP")
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "bump_type=$BUMP" >> $GITHUB_OUTPUT
+          echo "当前版本: $VERSION | bump: $BUMP -> 新版本: $NEW_VERSION"
+
+      - name: 修改文件中的版本号
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new_version }}"
+          export NEW_VERSION
+          node -e "
+            const v = process.env.NEW_VERSION;
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = v;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+            const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            tauri.version = v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(tauri, null, 2));
+          "
+          # 仅支持根 [package] 下 version 单行
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
+          echo "已更新 package.json、src-tauri/tauri.conf.json、src-tauri/Cargo.toml 版本号为 $NEW_VERSION"
+          grep -E '"version"|^version' package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+
+      - name: 提交版本更新
+        run: |
+          git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json
+          git diff --staged --quiet || git commit -m "chore(版本): 自动更新版本号至 ${{ steps.bump.outputs.new_version }}"
+          git push origin main
+
+      - name: 创建并推送 Tag
+        run: |
+          git tag -a "v${{ steps.bump.outputs.new_version }}" -m "Release v${{ steps.bump.outputs.new_version }}"
+          git push origin "v${{ steps.bump.outputs.new_version }}"
+
+  build:
+    runs-on: windows-latest
+    needs: bump-and-tag
+    if: always() && (needs.bump-and-tag.result == 'success' || github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.bump-and-tag.outputs.new_version && format('v{0}', needs.bump-and-tag.outputs.new_version) || github.ref }}
+
+      - name: 确定构建标识
+        id: tag
+        shell: bash
+        run: |
+          NEW_VERSION="${{ needs.bump-and-tag.outputs.new_version || '' }}"
+          if [ -n "$NEW_VERSION" ]; then
+            echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            # workflow_dispatch：用版本号+分支名+短SHA，避免与正式版本冲突
+            # 分支名中的 / 替换为 -，否则 Windows 下 zip 路径非法
+            VERSION=$(node -p "require('./package.json').version")
+            BRANCH="${GITHUB_REF_NAME//\//-}"
+            SHORT_SHA="${GITHUB_SHA:0:7}"
+            echo "tag=v${VERSION}-${BRANCH}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,9 +139,9 @@ jobs:
         run: |
           $targetDir = "src-tauri\target\x86_64-pc-windows-msvc\release"
           $exePath = "$targetDir\remote-tool.exe"
-          $zipName = "remote-tool-portable-${{ github.ref_name }}.zip"
+          $tagName = "${{ steps.tag.outputs.tag }}"
+          $zipName = "remote-tool-portable-$tagName.zip"
           
-          # Check if executable exists
           if (-not (Test-Path $exePath)) {
             Write-Error "Executable not found: $exePath"
             exit 1
@@ -49,54 +151,39 @@ jobs:
           $exeSize = [math]::Round((Get-Item $exePath).Length / 1MB, 2)
           Write-Host "File size: $exeSize MB"
           
-          # Create temporary directory for packaging
           $packageDir = "portable-package"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-          
-          # Copy executable
           Copy-Item $exePath "$packageDir\remote-tool.exe"
           
-          # Check and copy DLL files if any
           $dllFiles = Get-ChildItem -Path $targetDir -Filter "*.dll" -ErrorAction SilentlyContinue
           if ($dllFiles) {
             foreach ($dll in $dllFiles) {
               Copy-Item $dll.FullName $packageDir\
               Write-Host "Copied DLL: $($dll.Name)"
             }
-          } else {
-            Write-Host "No additional DLL files found (this is normal, Rust programs are usually statically linked)"
           }
           
-          # Create zip archive
           Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
-          
           $zipSize = [math]::Round((Get-Item $zipName).Length / 1MB, 2)
           Write-Host "Created portable package: $zipName ($zipSize MB)"
-          
-          # List zip contents
-          Write-Host ""
-          Write-Host "Zip contents:"
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipName)
-          $zip.Entries | ForEach-Object { Write-Host "  - $($_.FullName)" }
-          $zip.Dispose()
-          
-          # Cleanup temporary directory
-          Remove-Item -Path $packageDir -Recurse -Force
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: 上传构建产物（Artifact）
+        if: steps.tag.outputs.is_release == 'false'
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          name: 'Remote Tool ${{ github.ref_name }}'
+          name: remote-tool-portable-${{ steps.tag.outputs.tag }}
+          path: portable-package/
+          retention-days: 7
+
+      - name: 创建 Release
+        if: steps.tag.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: 'Remote Tool ${{ steps.tag.outputs.tag }}'
+          generate_release_notes: true
           body: |
-            ## Remote Tool ${{ github.ref_name }}
-            
-            **Build Information:**
-            - Build Date: ${{ github.event.head_commit.timestamp }}
-            - Git Commit: ${{ github.sha }}
-            
-            **使用方式（便携版）:**
+            ## 使用方式（便携版）
             1. 下载 `remote-tool-portable-*.zip` 压缩包
             2. 解压到任意目录
             3. 直接运行 `remote-tool.exe` 即可（无需安装）

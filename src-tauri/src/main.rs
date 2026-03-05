@@ -19,12 +19,13 @@ fn main() {
             commands::export_to_csv,
             commands::export_wide_table_direct,
             commands::export_demand_results_direct,
+            commands::sync_database,
+            commands::clear_db_cache,
             commands::check_deploy_status,
             commands::deploy_application,
         ])
         .setup(|_app| {
             // SSH 连接在断开时会自动清理资源
-            // 临时文件在查询过程中通过 Python 脚本和 trap 命令确保清理
             Ok(())
         })
         .run(tauri::generate_context!())

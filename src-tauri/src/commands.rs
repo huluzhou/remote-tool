@@ -107,6 +107,20 @@ pub async fn export_demand_results_direct(
 }
 
 #[tauri::command]
+pub async fn sync_database(
+    app: tauri::AppHandle,
+    db_path: String,
+) -> Result<String, String> {
+    crate::query::sync_database(db_path, Some(app)).await
+}
+
+#[tauri::command]
+pub async fn clear_db_cache() -> Result<(), String> {
+    crate::query::clear_db_cache();
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn check_deploy_status() -> Result<DeployStatus, String> {
     crate::deploy::check_deploy_status().await
 }

@@ -40,6 +40,9 @@ export const useQueryStore = defineStore("query", {
     logs: [] as string[],
     exportedRows: 0,
     exportedPath: null as string | null,
+    dbSynced: false,
+    dbSyncTime: null as string | null,
+    syncing: false,
   }),
 
   actions: {
@@ -153,6 +156,41 @@ export const useQueryStore = defineStore("query", {
       }
     },
 
+    async syncDatabase(dbPath: string): Promise<void> {
+      this.syncing = true;
+      this.error = null;
+      this.logs = [];
+
+      const unlisten = await listen<string>("query-log", (event) => {
+        this.logs.push(event.payload);
+      });
+
+      try {
+        await invoke<string>("sync_database", { dbPath });
+        this.dbSynced = true;
+        this.dbSyncTime = new Date().toLocaleTimeString("zh-CN", {
+          hour12: false,
+        });
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.error = errorMsg;
+      } finally {
+        unlisten();
+        this.syncing = false;
+      }
+    },
+
+    async clearDbCache(): Promise<void> {
+      try {
+        await invoke("clear_db_cache");
+        this.dbSynced = false;
+        this.dbSyncTime = null;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.error = errorMsg;
+      }
+    },
+
     updateProgress(progress: number, message: string) {
       this.progress = progress;
       this.progressMessage = message;
@@ -166,6 +204,7 @@ export const useQueryStore = defineStore("query", {
       this.logs = [];
       this.exportedRows = 0;
       this.exportedPath = null;
+      // dbSynced 和 dbSyncTime 不重置，跨查询保持同步状态
     },
   },
 });
