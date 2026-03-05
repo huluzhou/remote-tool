@@ -266,11 +266,11 @@ except Exception as e:
     
     // 解析输出，获取临时文件路径和行数
     let result: HashMap<String, serde_json::Value> = serde_json::from_str(&stdout.trim())
-        .map_err(|e| format!("解析查询结果失败: {}", e))?;
+        .map_err(|e| format!("解析查询结果失败: {}。原始输出: {}, 错误输出: {}", e, stdout.trim(), stderr.trim()))?;
     
     let remote_temp_file = result.get("file")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "未找到临时文件路径".to_string())?;
+        .ok_or_else(|| format!("远程脚本未返回临时文件路径，返回内容: {}", stdout.trim()))?;
     let row_count = result.get("rows")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
@@ -528,11 +528,11 @@ except Exception as e:
     
     // 解析输出，获取临时文件路径和行数
     let result: HashMap<String, serde_json::Value> = serde_json::from_str(&stdout.trim())
-        .map_err(|e| format!("解析查询结果失败: {}", e))?;
+        .map_err(|e| format!("解析查询结果失败: {}。原始输出: {}, 错误输出: {}", e, stdout.trim(), stderr.trim()))?;
     
     let remote_temp_file = result.get("file")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "未找到临时文件路径".to_string())?;
+        .ok_or_else(|| format!("远程脚本未返回临时文件路径，返回内容: {}", stdout.trim()))?;
     let row_count = result.get("rows")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
