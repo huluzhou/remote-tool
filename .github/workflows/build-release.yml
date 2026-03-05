@@ -14,7 +14,7 @@ jobs:
   # 仅在 push 到 main 时执行版本号更新和打 tag（跳过由 CI 自己推送的版本更新提交，避免无限循环）
   bump-and-tag:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'chore(版本): 自动更新版本号')
+    if: "github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'chore(版本): 自动更新版本号')"
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
     steps:
