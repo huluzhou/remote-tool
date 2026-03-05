@@ -689,7 +689,7 @@ try:
             if not rows:
                 break
             for row in rows:
-                row_data = [row[i] if row[i] is not None else '' for i in range(len(columns))]
+                row_data = [str(row[i]) if row[i] is not None else '' for i in range(len(columns))]
                 writer.writerow(row_data)
     
     # 输出临时文件路径
