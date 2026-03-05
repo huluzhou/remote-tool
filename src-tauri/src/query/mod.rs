@@ -390,12 +390,12 @@ pub async fn export_demand_results_direct(
     // 将参数进行base64编码，避免shell注入
     let db_path_b64 = general_purpose::STANDARD.encode(db_path.as_bytes());
     
-    // 创建远程临时文件路径（CSV+Gzip格式，最高压缩级别）
+    // 创建远程临时文件路径（CSV+Gzip格式，最快压缩级别）
     let mut uuid_buffer = [0u8; 32];
     let temp_file = format!("/tmp/demand_results_export_{}.csv.gz", Uuid::new_v4().simple().encode_lower(&mut uuid_buffer));
     
     // 创建Python脚本来执行流式查询和压缩
-    // 使用gzip最高压缩级别（compresslevel=9）和流式处理（fetchmany）
+    // 使用gzip最快压缩级别（compresslevel=1）和流式处理（fetchmany），降低嵌入式设备CPU负载
     let python_script = format!(r#"
 import sqlite3
 import csv
@@ -442,6 +442,13 @@ try:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
+    # 检查 demand_results 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='demand_results'")
+    if not cursor.fetchone():
+        error_msg = json.dumps({{"error": "数据库中不存在 demand_results 表"}}, ensure_ascii=False)
+        print(error_msg, file=sys.stderr)
+        sys.exit(1)
+    
     # 执行查询（使用参数化查询避免SQL注入）
     sql = "SELECT id, timestamp, meter_sn, calculated_demand FROM demand_results WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC"
     cursor.execute(sql, (start_time, end_time))
@@ -449,16 +456,14 @@ try:
     # 定义列名
     columns = ['id', 'timestamp', 'meter_sn', 'calculated_demand']
     
-    # 流式写入CSV到临时文件并压缩（最高压缩级别）
+    # 流式写入CSV到临时文件并压缩（最快压缩级别，降低CPU负载）
     # 使用fetchmany分批读取，避免一次性加载所有数据到内存
     row_count = 0
-    batch_size = 1000  # 每批处理1000行
+    batch_size = 5000  # 每批处理5000行
     
-    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=9) as gz_file:
-        # 配置CSV writer使用QUOTE_NONNUMERIC，确保非数字值（包括时间字符串）都被引号括起来
-        # 这样可以确保Excel正确识别文本值，不会尝试解析为时间类型
-        writer = csv.DictWriter(gz_file, fieldnames=columns, extrasaction='ignore', quoting=csv.QUOTE_NONNUMERIC)
-        writer.writeheader()
+    with gzip.open(temp_file, 'wt', encoding='utf-8', newline='', compresslevel=1) as gz_file:
+        writer = csv.writer(gz_file, quoting=csv.QUOTE_NONNUMERIC)
+        writer.writerow(columns)
         
         # 分批读取数据
         while True:
@@ -467,14 +472,12 @@ try:
                 break
             
             for row in rows:
-                row_dict = {{}}
-                row_dict['id'] = row[0] if row[0] is not None else ''
-                # 格式化时间戳
-                row_dict['timestamp'] = format_timestamp(row[1])
-                row_dict['meter_sn'] = row[2] if row[2] is not None else ''
-                # calculated_demand 是数字，保持为数字类型
-                row_dict['calculated_demand'] = row[3] if row[3] is not None else 0.0
-                writer.writerow(row_dict)
+                row_data = []
+                row_data.append(row[0] if row[0] is not None else '')
+                row_data.append(format_timestamp(row[1]))
+                row_data.append(row[2] if row[2] is not None else '')
+                row_data.append(row[3] if row[3] is not None else 0.0)
+                writer.writerow(row_data)
                 row_count += 1
     
     # 输出临时文件路径和行数
