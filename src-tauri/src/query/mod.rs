@@ -38,7 +38,8 @@ pub async fn sync_database(
     let uuid_str = Uuid::new_v4().simple().encode_lower(&mut uuid_buf).to_string();
     let remote_tmp = format!("/tmp/remote_tool_backup_{}.db", uuid_str);
 
-    // 尝试使用 sqlite3 .backup 创建一致性快照
+    // 三级备份策略：sqlite3 .backup → python sqlite3.backup → cp + WAL
+    // 优先使用 sqlite3 CLI
     let backup_cmd = format!(
         "sqlite3 \"{}\" \".backup '{}'\"",
         db_path, remote_tmp
@@ -48,47 +49,83 @@ pub async fn sync_database(
         .await
         .map_err(|e| format!("执行远程备份命令失败: {}", e))?;
 
+    let mut used_cp_fallback = false;
     if exit_code != 0 {
         let is_not_found = stderr.to_lowercase().contains("command not found")
             || stderr.to_lowercase().contains("not found");
         if is_not_found {
-            add_query_log(app_handle_ref, "sqlite3 不可用，回退到 cp 复制数据库文件...");
+            add_query_log(app_handle_ref, "sqlite3 不可用，尝试 Python backup...");
         } else {
-            add_query_log(app_handle_ref, &format!("sqlite3 备份失败({}), 回退到 cp...", stderr.trim()));
+            add_query_log(app_handle_ref, &format!("sqlite3 备份失败({}), 尝试 Python backup...", stderr.trim()));
         }
-        let cp_cmd = format!("cp \"{}\" \"{}\"", db_path, remote_tmp);
-        let (cp_exit, _cp_stdout, cp_stderr) = SshClient::execute_command(&cp_cmd)
+
+        // 第二级：Python sqlite3.Connection.backup()，原子快照，自动处理 WAL
+        let py_backup_cmd = format!(
+            "python3 -c \"import sqlite3; s=sqlite3.connect('{}'); d=sqlite3.connect('{}'); s.backup(d); d.close(); s.close(); print('ok')\"",
+            db_path, remote_tmp
+        );
+        let (py_exit, py_stdout, py_stderr) = SshClient::execute_command(&py_backup_cmd)
             .await
-            .map_err(|e| format!("执行远程复制命令失败: {}", e))?;
-        if cp_exit != 0 {
-            return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
+            .map_err(|e| format!("执行 Python 备份命令失败: {}", e))?;
+
+        if py_exit != 0 || !py_stdout.trim().contains("ok") {
+            let py_not_found = py_stderr.to_lowercase().contains("command not found")
+                || py_stderr.to_lowercase().contains("not found")
+                || py_stderr.to_lowercase().contains("no module");
+            if py_not_found {
+                add_query_log(app_handle_ref, "Python 不可用，回退到 cp 复制...");
+            } else {
+                add_query_log(app_handle_ref, &format!("Python 备份失败({}), 回退到 cp...", py_stderr.trim()));
+            }
+
+            // 第三级：cp + WAL/SHM 文件
+            used_cp_fallback = true;
+            let cp_cmd = format!(
+                "cp \"{}\" \"{}\" && cp \"{}-wal\" \"{}-wal\" 2>/dev/null; cp \"{}-shm\" \"{}-shm\" 2>/dev/null; true",
+                db_path, remote_tmp,
+                db_path, remote_tmp,
+                db_path, remote_tmp
+            );
+            let (cp_exit, _cp_stdout, cp_stderr) = SshClient::execute_command(&cp_cmd)
+                .await
+                .map_err(|e| format!("执行远程复制命令失败: {}", e))?;
+            if cp_exit != 0 {
+                return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
+            }
+        } else {
+            add_query_log(app_handle_ref, "Python sqlite3.backup 快照创建成功");
         }
     }
 
     // 验证远程临时文件确实存在并获取大小
     let verify_cmd = format!("ls -l \"{}\" 2>&1", remote_tmp);
-    let (verify_exit, verify_stdout, _) = SshClient::execute_command(&verify_cmd)
+    let (verify_exit, mut file_info, _) = SshClient::execute_command(&verify_cmd)
         .await
         .map_err(|e| format!("验证远程文件失败: {}", e))?;
-    if verify_exit != 0 || verify_stdout.contains("No such file") {
-        // backup 声称成功但文件不存在，直接用 cp 重试
+    if verify_exit != 0 || file_info.contains("No such file") {
         add_query_log(app_handle_ref, "备份文件未生成，使用 cp 重试...");
-        let cp_cmd = format!("cp \"{}\" \"{}\"", db_path, remote_tmp);
+        used_cp_fallback = true;
+        let cp_cmd = format!(
+            "cp \"{}\" \"{}\" && cp \"{}-wal\" \"{}-wal\" 2>/dev/null; cp \"{}-shm\" \"{}-shm\" 2>/dev/null; true",
+            db_path, remote_tmp,
+            db_path, remote_tmp,
+            db_path, remote_tmp
+        );
         let (cp_exit, _, cp_stderr) = SshClient::execute_command(&cp_cmd)
             .await
             .map_err(|e| format!("执行远程复制命令失败: {}", e))?;
         if cp_exit != 0 {
             return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
         }
-        // 再次验证
         let (v2_exit, v2_stdout, _) = SshClient::execute_command(&verify_cmd)
             .await
             .map_err(|e| format!("验证远程文件失败: {}", e))?;
         if v2_exit != 0 || v2_stdout.contains("No such file") {
             return Err(format!("远程数据库文件无法创建。ls 输出: {}", v2_stdout.trim()));
         }
+        file_info = v2_stdout;
     }
-    add_query_log(app_handle_ref, &format!("远程文件就绪: {}", verify_stdout.trim()));
+    add_query_log(app_handle_ref, &format!("远程文件就绪: {}", file_info.trim()));
 
     // 本地临时目录
     let local_dir = std::env::temp_dir();
@@ -102,6 +139,20 @@ pub async fn sync_database(
         .await
         .map_err(|e| format!("下载数据库文件失败: {}", e))?;
 
+    // cp 路径下需要额外下载 WAL/SHM 文件；sqlite3 .backup 和 Python backup 生成的是完整独立 .db
+    if used_cp_fallback {
+        let remote_wal = format!("{}-wal", remote_tmp);
+        let local_wal = format!("{}-wal", local_path_str);
+        if SshClient::download_file(&remote_wal, &local_wal).await.is_ok() {
+            add_query_log(app_handle_ref, "已下载 WAL 文件");
+        }
+        let remote_shm = format!("{}-shm", remote_tmp);
+        let local_shm = format!("{}-shm", local_path_str);
+        if SshClient::download_file(&remote_shm, &local_shm).await.is_ok() {
+            add_query_log(app_handle_ref, "已下载 SHM 文件");
+        }
+    }
+
     // 验证下载的文件
     let file_size = std::fs::metadata(&local_path)
         .map_err(|e| format!("获取下载文件信息失败: {}", e))?
@@ -109,7 +160,13 @@ pub async fn sync_database(
     add_query_log(app_handle_ref, &format!("数据库下载完成，文件大小: {:.2}MB", file_size as f64 / 1024.0 / 1024.0));
 
     // 清理远程临时文件
-    let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_tmp)).await;
+    if used_cp_fallback {
+        let _ = SshClient::execute_command(&format!(
+            "rm -f \"{}\" \"{}-wal\" \"{}-shm\"", remote_tmp, remote_tmp, remote_tmp
+        )).await;
+    } else {
+        let _ = SshClient::execute_command(&format!("rm -f \"{}\"", remote_tmp)).await;
+    }
 
     // 更新缓存
     {
