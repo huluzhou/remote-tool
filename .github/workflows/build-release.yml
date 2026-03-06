@@ -127,6 +127,30 @@ jobs:
         with:
           toolchain: stable
 
+      - name: 生成 Release Changelog
+        if: steps.tag.outputs.is_release == 'true'
+        shell: bash
+        run: |
+          cargo install git-cliff
+          git cliff --config cliff.toml --latest --strip all -o release-changelog.md
+          {
+            echo "## 使用方式（便携版）"
+            echo ""
+            echo "**下载地址:** [Releases / Latest](https://github.com/${{ github.repository }}/releases/latest)"
+            echo ""
+            echo "1. 下载 \`remote-tool-portable-*.zip\` 压缩包"
+            echo "2. 解压到任意目录"
+            echo "3. 直接运行 \`remote-tool.exe\` 即可（无需安装）"
+            echo ""
+            echo "**功能:**"
+            echo "- 数据查询：通过SSH连接远程服务器查询SQLite数据库"
+            echo "- 应用部署：通过SSH部署应用程序到远程服务器"
+            echo ""
+            echo "---"
+            echo ""
+            cat release-changelog.md 2>/dev/null || echo "## Changelog"
+          } > release-notes.md
+
       - name: Install frontend dependencies
         run: npm install
 
@@ -181,16 +205,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: 'Remote Tool ${{ steps.tag.outputs.tag }}'
-          generate_release_notes: true
-          body: |
-            ## 使用方式（便携版）
-            1. 下载 `remote-tool-portable-*.zip` 压缩包
-            2. 解压到任意目录
-            3. 直接运行 `remote-tool.exe` 即可（无需安装）
-            
-            **功能:**
-            - 数据查询：通过SSH连接远程服务器查询SQLite数据库
-            - 应用部署：通过SSH部署应用程序到远程服务器
+          body_path: release-notes.md
           files: remote-tool-portable-*.zip
           draft: false
           prerelease: false
