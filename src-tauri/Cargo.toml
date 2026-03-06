@@ -1,6 +1,6 @@
 [package]
 name = "remote-tool"
-version = "2.3.0"
+version = "2.4.0"
 description = "Remote tool for data query and application deployment"
 authors = ["you"]
 license = ""
