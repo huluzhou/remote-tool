@@ -136,7 +136,7 @@ jobs:
           {
             echo "## 使用方式（便携版）"
             echo ""
-            echo "**下载地址:** [Releases / Latest](https://github.com/${{ github.repository }}/releases/latest)"
+            echo "**下载地址:** https://github.com/${{ github.repository }}/releases/latest"
             echo ""
             echo "1. 下载 \`remote-tool-portable-*.zip\` 压缩包"
             echo "2. 解压到任意目录"
