@@ -115,17 +115,59 @@ pub async fn sync_database(
 
     add_query_log(app_handle_ref, &format!("远程文件就绪: {}", file_info.trim()));
 
+    // 从 ls -l 输出解析文件大小（第5列），用于进度条
+    let total_size: Option<u64> = file_info
+        .split_whitespace()
+        .nth(4)
+        .and_then(|s| s.parse().ok());
+
     // 本地临时目录
     let local_dir = std::env::temp_dir();
     let local_filename = format!("remote_tool_cache_{}.db", uuid_str);
     let local_path = local_dir.join(&local_filename);
     let local_path_str = local_path.to_string_lossy().to_string();
 
-    // SFTP 流式下载（分块读写，不加载整个文件到内存）
+    // SFTP 流式下载（分块读写，不加载整个文件到内存），带进度事件
     add_query_log(app_handle_ref, "通过 SFTP 下载数据库文件...");
-    SshClient::download_file(&remote_tmp, &local_path_str)
-        .await
-        .map_err(|e| format!("下载数据库文件失败: {}", e))?;
+    if let (Some(handle), Some(total)) = (app_handle_ref, total_size) {
+        use tauri::Emitter;
+        let _ = handle.emit("db-sync-progress", serde_json::json!({
+            "downloaded": 0,
+            "total": total,
+            "percent": 0
+        }));
+    }
+    let on_progress = app_handle_ref.map(|_handle| {
+        use tauri::Emitter;
+        let handle = _handle.clone();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(16);
+        let handle_clone = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some((downloaded, total)) = progress_rx.recv().await {
+                let percent = if total > 0 {
+                    ((downloaded * 100) / total).min(100) as u32
+                } else {
+                    0
+                };
+                let _ = handle_clone.emit("db-sync-progress", serde_json::json!({
+                    "downloaded": downloaded,
+                    "total": total,
+                    "percent": percent
+                }));
+            }
+        });
+        std::sync::Arc::new(move |d: u64, t: u64| {
+            let _ = progress_tx.try_send((d, t));
+        }) as std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
+    });
+    SshClient::download_file_with_progress(
+        &remote_tmp,
+        &local_path_str,
+        total_size,
+        on_progress,
+    )
+    .await
+    .map_err(|e| format!("下载数据库文件失败: {}", e))?;
 
     // cp 路径下需要额外下载 WAL/SHM 文件；sqlite3 .backup 和 Python backup 生成的是完整独立 .db
     if used_cp_fallback {

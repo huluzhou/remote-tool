@@ -33,17 +33,28 @@
         />
       </div>
       <div class="form-group sync-group">
-        <button
-          type="button"
-          class="sync-btn"
-          :disabled="syncing || !sshConnected"
-          @click="handleSync"
-        >
-          {{ syncing ? '同步中...' : '同步数据库' }}
-        </button>
-        <span class="sync-status" :class="{ synced: queryStore.dbSynced }">
-          {{ queryStore.dbSynced ? `已同步 (${queryStore.dbSyncTime})` : '未同步' }}
-        </span>
+        <div class="sync-controls">
+          <button
+            type="button"
+            class="sync-btn"
+            :disabled="syncing || !sshConnected"
+            @click="handleSync"
+          >
+            {{ syncing ? '同步中...' : '同步数据库' }}
+          </button>
+          <span class="sync-status" :class="{ synced: queryStore.dbSynced }">
+            {{ queryStore.dbSynced ? `已同步 (${queryStore.dbSyncTime})` : '未同步' }}
+          </span>
+        </div>
+        <div v-if="syncing" class="sync-progress">
+          <div class="progress-bar">
+            <div
+              class="progress-fill"
+              :style="{ width: `${queryStore.syncProgress}%` }"
+            />
+          </div>
+          <span class="progress-text">{{ queryStore.syncProgressMessage }}</span>
+        </div>
       </div>
       <div class="form-group">
         <label>开始时间:</label>
@@ -258,8 +269,39 @@ const handleSubmit = () => {
 
 .sync-group {
   display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.sync-controls {
+  display: flex;
   align-items: center;
   gap: 1rem;
+}
+
+.sync-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.progress-bar {
+  height: 6px;
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background-color: #4caf50;
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+
+.progress-text {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.6);
 }
 
 .sync-btn {

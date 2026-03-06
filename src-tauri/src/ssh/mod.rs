@@ -148,6 +148,16 @@ impl SshClient {
 
     /// 从远程服务器下载文件（流式 SFTP，分块读写，不将整个文件加载到内存）
     pub async fn download_file(remote_path: &str, local_path: &str) -> Result<()> {
+        Self::download_file_with_progress(remote_path, local_path, None, None).await
+    }
+
+    /// 带进度回调的下载，on_progress(downloaded_bytes, total_bytes)，每约 2% 进度调用一次
+    pub async fn download_file_with_progress(
+        remote_path: &str,
+        local_path: &str,
+        total_size: Option<u64>,
+        on_progress: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use russh_sftp::{client::SftpSession, protocol::OpenFlags};
         
@@ -156,7 +166,6 @@ impl SshClient {
         let start_time = std::time::Instant::now();
         Self::log(&format!("[SFTP] 开始下载文件: {} -> {}", remote_path, local_path));
         
-        // 建立 SFTP 会话
         let channel = client.get_channel().await
             .with_context(|| "建立SFTP通道失败")?;
         channel.request_subsystem(true, "sftp").await
@@ -164,17 +173,15 @@ impl SshClient {
         let sftp = SftpSession::new(channel.into_stream()).await
             .with_context(|| "创建SFTP会话失败")?;
         
-        // 打开远程文件
         let mut remote_file = sftp.open_with_flags(remote_path, OpenFlags::READ).await
             .with_context(|| format!("打开远程文件失败: {}", remote_path))?;
         
-        // 创建本地文件
         let mut local_file = tokio::fs::File::create(local_path).await
             .with_context(|| format!("创建本地文件失败: {}", local_path))?;
         
-        // 分块读写（256KB 缓冲区，平衡内存和性能）
         let mut total_bytes: u64 = 0;
         let mut last_log_bytes: u64 = 0;
+        let mut last_emit_pct: u8 = 0;
         let mut buf = vec![0u8; 256 * 1024];
         
         loop {
@@ -187,11 +194,24 @@ impl SshClient {
                 .with_context(|| "写入本地文件失败")?;
             total_bytes += n as u64;
             
-            // 每 10MB 记录一次进度
             if total_bytes - last_log_bytes >= 10 * 1024 * 1024 {
                 Self::log(&format!("[SFTP] 已下载: {:.1}MB", total_bytes as f64 / 1024.0 / 1024.0));
                 last_log_bytes = total_bytes;
             }
+            
+            if let (Some(ref cb), Some(total)) = (&on_progress, &total_size) {
+                if *total > 0 {
+                    let pct = (total_bytes * 100 / *total).min(100) as u8;
+                    if pct >= last_emit_pct + 2 || pct == 100 {
+                        last_emit_pct = pct;
+                        cb(total_bytes, *total);
+                    }
+                }
+            }
+        }
+        
+        if let (Some(ref cb), Some(total)) = (&on_progress, &total_size) {
+            cb(total_bytes, *total);
         }
         
         local_file.flush().await
