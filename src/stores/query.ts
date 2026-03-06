@@ -43,6 +43,8 @@ export const useQueryStore = defineStore("query", {
     dbSynced: false,
     dbSyncTime: null as string | null,
     syncing: false,
+    syncProgress: 0,
+    syncProgressMessage: "",
   }),
 
   actions: {
@@ -160,9 +162,22 @@ export const useQueryStore = defineStore("query", {
       this.syncing = true;
       this.error = null;
       this.logs = [];
+      this.syncProgress = 0;
+      this.syncProgressMessage = "准备同步...";
 
-      const unlisten = await listen<string>("query-log", (event) => {
+      const unlistenLog = await listen<string>("query-log", (event) => {
         this.logs.push(event.payload);
+      });
+
+      const unlistenProgress = await listen<{
+        downloaded: number;
+        total: number;
+        percent: number;
+      }>("db-sync-progress", (event) => {
+        const { downloaded, total, percent } = event.payload;
+        this.syncProgress = percent;
+        const mb = (n: number) => (n / 1024 / 1024).toFixed(2);
+        this.syncProgressMessage = `${mb(downloaded)}MB / ${mb(total)}MB (${percent}%)`;
       });
 
       try {
@@ -171,11 +186,15 @@ export const useQueryStore = defineStore("query", {
         this.dbSyncTime = new Date().toLocaleTimeString("zh-CN", {
           hour12: false,
         });
+        this.syncProgress = 100;
+        this.syncProgressMessage = "同步完成";
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         this.error = errorMsg;
+        this.syncProgressMessage = "同步失败";
       } finally {
-        unlisten();
+        unlistenLog();
+        unlistenProgress();
         this.syncing = false;
       }
     },
