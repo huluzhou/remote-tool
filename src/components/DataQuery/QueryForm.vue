@@ -3,6 +3,27 @@
     <h3>{{ queryType === 'wide_table' ? '导出宽表数据' : '导出需量数据' }}</h3>
     <form @submit.prevent="handleSubmit">
       <div class="form-group">
+        <label>数据库来源:</label>
+        <div class="radio-group">
+          <label>
+            <input
+              type="radio"
+              value="remote_sync"
+              v-model="sourceMode"
+            />
+            远程同步（默认）
+          </label>
+          <label>
+            <input
+              type="radio"
+              value="local_import"
+              v-model="sourceMode"
+            />
+            本地导入（备用）
+          </label>
+        </div>
+      </div>
+      <div class="form-group">
         <label>查询类型:</label>
         <div class="radio-group">
           <label>
@@ -23,16 +44,28 @@
           </label>
         </div>
       </div>
-      <div class="form-group">
+      <div v-if="sourceMode === 'remote_sync'" class="form-group">
         <label>数据库路径:</label>
         <input
-          v-model="formData.dbPath"
+          v-model="remoteDbPath"
           type="text"
           placeholder="/mnt/analysis/data/device_data.db"
           required
         />
       </div>
-      <div class="form-group sync-group">
+      <div v-if="sourceMode === 'remote_sync'" class="form-group">
+        <label>同步落盘路径:</label>
+        <div class="time-input-group">
+          <input
+            v-model="syncTargetPath"
+            type="text"
+            placeholder="请选择本地数据库保存路径（*.db）"
+            required
+          />
+          <button type="button" @click="pickSyncTargetPath">选择路径</button>
+        </div>
+      </div>
+      <div v-if="sourceMode === 'remote_sync'" class="form-group sync-group">
         <div class="sync-controls">
           <button
             type="button"
@@ -56,19 +89,37 @@
           <span class="progress-text">{{ queryStore.syncProgressMessage }}</span>
         </div>
       </div>
+      <div v-if="sourceMode === 'local_import'" class="form-group">
+        <label>本地数据库文件:</label>
+        <div class="time-input-group">
+          <input
+            :value="queryStore.importedDbPath"
+            type="text"
+            placeholder="请选择已下载数据库文件（*.db）"
+            readonly
+          />
+          <button type="button" @click="importLocalDatabase">导入数据库</button>
+        </div>
+      </div>
+      <div v-if="queryStore.activeDbPath" class="form-group active-db-info">
+        <p>当前活动数据库: {{ queryStore.activeDbPath }}</p>
+        <p v-if="queryStore.lastReadyAt">最近可用时间: {{ queryStore.lastReadyAt }}</p>
+      </div>
       <div class="form-group">
         <label>开始时间:</label>
         <div class="time-input-group">
           <input
-            v-model="startTimeInput"
+            v-model="startDateTimeText"
             type="text"
-            placeholder="时间戳或日期"
+            placeholder="YYYY-MM-DD HH:mm:ss"
             required
           />
           <div class="quick-buttons">
             <button type="button" @click="setTimeRange('today')">今天</button>
             <button type="button" @click="setTimeRange('yesterday')">昨天</button>
             <button type="button" @click="setTimeRange('7days')">最近7天</button>
+            <button type="button" @click="setTimeRange('30days')">最近30天</button>
+            <button type="button" @click="setTimeRange('thisMonth')">本月</button>
           </div>
         </div>
       </div>
@@ -76,9 +127,9 @@
         <label>结束时间:</label>
         <div class="time-input-group">
           <input
-            v-model="endTimeInput"
+            v-model="endDateTimeText"
             type="text"
-            placeholder="时间戳或日期"
+            placeholder="YYYY-MM-DD HH:mm:ss"
             required
           />
           <button type="button" @click="setEndTimeNow">现在</button>
@@ -92,9 +143,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue";
-import { useQueryStore } from "../../stores/query";
+import { ref, computed, onMounted } from "vue";
+import { useQueryStore, type SourceMode } from "../../stores/query";
 import { useSshStore } from "../../stores/ssh";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
 const emit = defineEmits<{
   query: [params: any];
@@ -105,94 +157,189 @@ const sshStore = useSshStore();
 const loading = computed(() => queryStore.loading);
 const syncing = computed(() => queryStore.syncing);
 const sshConnected = computed(() => sshStore.isConnected);
+const sourceMode = computed({
+  get: () => queryStore.sourceMode,
+  set: (value: SourceMode) => queryStore.setSourceMode(value),
+});
+const remoteDbPath = computed({
+  get: () => queryStore.remoteDbPath,
+  set: (value) => queryStore.setRemoteDbPath(value),
+});
+const syncTargetPath = computed({
+  get: () => queryStore.syncTargetPath,
+  set: (value) => queryStore.setSyncTargetPath(value),
+});
+
+onMounted(async () => {
+  queryStore.loadSourceConfig();
+  if (queryStore.sourceMode === "remote_sync" && queryStore.activeDbPath) {
+    try {
+      await queryStore.validateLocalDatabase(queryStore.activeDbPath);
+      queryStore.dbSynced = true;
+    } catch {
+      queryStore.dbSynced = false;
+    }
+  }
+});
 
 const handleSync = () => {
   if (syncing.value || !sshConnected.value) return;
-  queryStore.syncDatabase(formData.value.dbPath);
+  if (!remoteDbPath.value.trim()) {
+    alert("请先填写远程数据库路径");
+    return;
+  }
+  if (!syncTargetPath.value.trim()) {
+    alert("请先设置同步落盘路径");
+    return;
+  }
+  queryStore.syncDatabase(remoteDbPath.value, syncTargetPath.value);
 };
 
 const queryType = ref<"wide_table" | "demand">("wide_table");
 
-const formData = ref({
-  dbPath: "/mnt/analysis/data/device_data.db",
-});
+const startDateTimeText = ref("");
+const endDateTimeText = ref("");
 
-const startTimeInput = ref("");
-const endTimeInput = ref("");
+const pickSyncTargetPath = async () => {
+  const selected = await save({
+    filters: [
+      {
+        name: "SQLite",
+        extensions: ["db"],
+      },
+    ],
+    defaultPath: queryStore.syncTargetPath || "device_data.db",
+  });
 
-const parseTime = (input: string): number | null => {
-  const trimmed = input.trim();
-  if (!trimmed) return null;
+  if (!selected) return;
+  queryStore.setSyncTargetPath(selected);
+};
 
-  // 如果是纯数字，当作时间戳
-  if (/^\d+$/.test(trimmed)) {
-    return parseInt(trimmed);
+const importLocalDatabase = async () => {
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    filters: [
+      {
+        name: "SQLite",
+        extensions: ["db", "sqlite", "sqlite3"],
+      },
+    ],
+  });
+
+  if (!selected || Array.isArray(selected)) return;
+
+  try {
+    await queryStore.validateLocalDatabase(selected);
+    queryStore.setImportedDbPath(selected);
+    queryStore.setActiveDbPath(selected);
+    queryStore.setSourceMode("local_import");
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    alert(`导入数据库失败: ${msg}`);
+  }
+};
+
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+
+const formatDateTimeText = (date: Date): string => {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+};
+
+const parseDateTimeToSeconds = (input: string): number | null => {
+  const value = input.trim();
+  if (!value) return null;
+
+  if (/^\d+$/.test(value)) {
+    const ts = Number(value);
+    if (!Number.isFinite(ts)) return null;
+    return value.length >= 13 ? Math.floor(ts / 1000) : ts;
   }
 
-  // 尝试解析日期
-  const date = new Date(trimmed);
-  if (!isNaN(date.getTime())) {
-    return Math.floor(date.getTime() / 1000);
+  let normalized = value.replace(/\//g, "-");
+  if (/^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}$/.test(normalized)) {
+    normalized += ":00";
   }
-
-  return null;
+  normalized = normalized.replace(" ", "T");
+  const date = new Date(normalized);
+  if (isNaN(date.getTime())) return null;
+  return Math.floor(date.getTime() / 1000);
 };
 
 const setTimeRange = (type: string) => {
   const now = new Date();
-  let start: Date;
+  let start = new Date(now);
+  let end = new Date(now);
 
   switch (type) {
     case "today":
-      start = new Date(now);
       start.setHours(0, 0, 0, 0);
-      startTimeInput.value = Math.floor(start.getTime() / 1000).toString();
-      endTimeInput.value = Math.floor(now.getTime() / 1000).toString();
       break;
     case "yesterday":
-      start = new Date(now);
       start.setDate(start.getDate() - 1);
       start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
+      end = new Date(start);
       end.setHours(23, 59, 59, 999);
-      startTimeInput.value = Math.floor(start.getTime() / 1000).toString();
-      endTimeInput.value = Math.floor(end.getTime() / 1000).toString();
       break;
     case "7days":
-      start = new Date(now);
       start.setDate(start.getDate() - 7);
-      startTimeInput.value = Math.floor(start.getTime() / 1000).toString();
-      endTimeInput.value = Math.floor(now.getTime() / 1000).toString();
+      break;
+    case "30days":
+      start.setDate(start.getDate() - 30);
+      break;
+    case "thisMonth":
+      start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0);
       break;
   }
+
+  startDateTimeText.value = formatDateTimeText(start);
+  endDateTimeText.value = formatDateTimeText(end);
 };
 
 const setEndTimeNow = () => {
-  endTimeInput.value = Math.floor(new Date().getTime() / 1000).toString();
+  endDateTimeText.value = formatDateTimeText(new Date());
 };
 
-const handleSubmit = () => {
+const handleSubmit = async () => {
   if (loading.value) {
     return; // 如果正在查询，不允许再次点击
   }
 
-  const startTime = parseTime(startTimeInput.value);
-  const endTime = parseTime(endTimeInput.value);
+  const startTime = parseDateTimeToSeconds(startDateTimeText.value);
+  const endTime = parseDateTimeToSeconds(endDateTimeText.value);
 
   if (!startTime || !endTime) {
     alert("请输入有效的时间范围");
     return;
   }
+  if (startTime > endTime) {
+    alert("开始时间不能晚于结束时间");
+    return;
+  }
 
-  const params = {
-    queryType: queryType.value,
-    dbPath: formData.value.dbPath,
-    startTime,
-    endTime,
-  };
+  const activeDbPath = queryStore.activeDbPath;
+  if (!activeDbPath) {
+    alert("请先同步数据库或导入本地数据库文件");
+    return;
+  }
 
-  emit("query", params);
+  try {
+    await queryStore.validateLocalDatabase(activeDbPath);
+    const params = {
+      queryType: queryType.value,
+      dbPath: activeDbPath,
+      startTime,
+      endTime,
+    };
+    emit("query", params);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    alert(`当前数据库不可用，请重新同步或导入。${msg}`);
+  }
 };
+
+// 初始化默认时间范围：最近7天
+setTimeRange("7days");
 </script>
 
 <style scoped>
@@ -218,7 +365,9 @@ const handleSubmit = () => {
   font-weight: 500;
 }
 
-.form-group input[type="text"] {
+.form-group input[type="text"],
+.form-group input[type="date"],
+.form-group input[type="time"] {
   width: 100%;
   padding: 0.5rem;
   border: 1px solid rgba(255, 255, 255, 0.2);
@@ -334,6 +483,19 @@ const handleSubmit = () => {
 
 .sync-status.synced {
   color: #4caf50;
+}
+
+.active-db-info {
+  padding: 0.75rem;
+  background-color: rgba(100, 108, 255, 0.1);
+  border: 1px solid rgba(100, 108, 255, 0.3);
+  border-radius: 6px;
+}
+
+.active-db-info p {
+  margin: 0.25rem 0;
+  word-break: break-all;
+  font-size: 0.85rem;
 }
 
 .submit-btn {

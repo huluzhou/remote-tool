@@ -20,6 +20,7 @@ fn main() {
             commands::export_wide_table_direct,
             commands::export_demand_results_direct,
             commands::sync_database,
+            commands::validate_local_database,
             commands::clear_db_cache,
             commands::check_deploy_status,
             commands::deploy_application,

@@ -10,6 +10,17 @@ export interface QueryParams {
   endTime: number;
 }
 
+export type SourceMode = "remote_sync" | "local_import";
+
+interface QuerySourceConfig {
+  sourceMode: SourceMode;
+  remoteDbPath: string;
+  syncTargetPath: string;
+  importedDbPath: string;
+  activeDbPath: string;
+  lastReadyAt: string | null;
+}
+
 export interface ExportWideTableParams {
   dbPath: string;
   startTime: number;
@@ -30,6 +41,36 @@ export interface QueryResult {
   totalRows: number;
 }
 
+const SOURCE_CONFIG_KEY = "query-source-config";
+
+const defaultRemoteDbPath = "/mnt/analysis/data/device_data.db";
+
+const defaultSourceConfig: QuerySourceConfig = {
+  sourceMode: "remote_sync",
+  remoteDbPath: defaultRemoteDbPath,
+  syncTargetPath: "",
+  importedDbPath: "",
+  activeDbPath: "",
+  lastReadyAt: null,
+};
+
+function loadSourceConfigFromStorage(): QuerySourceConfig {
+  try {
+    const saved = localStorage.getItem(SOURCE_CONFIG_KEY);
+    if (!saved) {
+      return { ...defaultSourceConfig };
+    }
+
+    const parsed = JSON.parse(saved) as Partial<QuerySourceConfig>;
+    return {
+      ...defaultSourceConfig,
+      ...parsed,
+    };
+  } catch {
+    return { ...defaultSourceConfig };
+  }
+}
+
 export const useQueryStore = defineStore("query", {
   state: () => ({
     results: null as QueryResult | null,
@@ -45,9 +86,67 @@ export const useQueryStore = defineStore("query", {
     syncing: false,
     syncProgress: 0,
     syncProgressMessage: "",
+    sourceMode: defaultSourceConfig.sourceMode as SourceMode,
+    remoteDbPath: defaultSourceConfig.remoteDbPath,
+    syncTargetPath: defaultSourceConfig.syncTargetPath,
+    importedDbPath: defaultSourceConfig.importedDbPath,
+    activeDbPath: defaultSourceConfig.activeDbPath,
+    lastReadyAt: defaultSourceConfig.lastReadyAt,
   }),
 
   actions: {
+    loadSourceConfig() {
+      const config = loadSourceConfigFromStorage();
+      this.sourceMode = config.sourceMode;
+      this.remoteDbPath = config.remoteDbPath;
+      this.syncTargetPath = config.syncTargetPath;
+      this.importedDbPath = config.importedDbPath;
+      this.activeDbPath = config.activeDbPath;
+      this.lastReadyAt = config.lastReadyAt;
+    },
+
+    saveSourceConfig() {
+      const config: QuerySourceConfig = {
+        sourceMode: this.sourceMode,
+        remoteDbPath: this.remoteDbPath,
+        syncTargetPath: this.syncTargetPath,
+        importedDbPath: this.importedDbPath,
+        activeDbPath: this.activeDbPath,
+        lastReadyAt: this.lastReadyAt,
+      };
+      localStorage.setItem(SOURCE_CONFIG_KEY, JSON.stringify(config));
+    },
+
+    setSourceMode(mode: SourceMode) {
+      this.sourceMode = mode;
+      this.saveSourceConfig();
+    },
+
+    setRemoteDbPath(path: string) {
+      this.remoteDbPath = path;
+      this.saveSourceConfig();
+    },
+
+    setSyncTargetPath(path: string) {
+      this.syncTargetPath = path;
+      this.saveSourceConfig();
+    },
+
+    setImportedDbPath(path: string) {
+      this.importedDbPath = path;
+      this.saveSourceConfig();
+    },
+
+    setActiveDbPath(path: string) {
+      this.activeDbPath = path;
+      this.lastReadyAt = new Date().toLocaleString("zh-CN", { hour12: false });
+      this.saveSourceConfig();
+    },
+
+    async validateLocalDatabase(path: string): Promise<void> {
+      await invoke("validate_local_database", { path });
+    },
+
     async exportWideTable(params: ExportWideTableParams): Promise<void> {
       this.loading = true;
       this.error = null;
@@ -158,7 +257,7 @@ export const useQueryStore = defineStore("query", {
       }
     },
 
-    async syncDatabase(dbPath: string): Promise<void> {
+    async syncDatabase(dbPath: string, targetPath?: string): Promise<void> {
       this.syncing = true;
       this.error = null;
       this.logs = [];
@@ -181,11 +280,15 @@ export const useQueryStore = defineStore("query", {
       });
 
       try {
-        await invoke<string>("sync_database", { dbPath });
+        const syncedPath = await invoke<string>("sync_database", {
+          dbPath,
+          targetPath: targetPath || this.syncTargetPath || null,
+        });
         this.dbSynced = true;
         this.dbSyncTime = new Date().toLocaleTimeString("zh-CN", {
           hour12: false,
         });
+        this.setActiveDbPath(syncedPath);
         this.syncProgress = 100;
         this.syncProgressMessage = "同步完成";
       } catch (error) {
@@ -204,6 +307,10 @@ export const useQueryStore = defineStore("query", {
         await invoke("clear_db_cache");
         this.dbSynced = false;
         this.dbSyncTime = null;
+        if (this.sourceMode === "remote_sync") {
+          this.activeDbPath = "";
+          this.saveSourceConfig();
+        }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         this.error = errorMsg;
