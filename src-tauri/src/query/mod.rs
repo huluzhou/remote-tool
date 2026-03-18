@@ -2,6 +2,7 @@ use crate::ssh::SshClient;
 use serde::{Deserialize, Serialize};
 use chrono::{Utc, FixedOffset, TimeZone};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use rusqlite::OpenFlags;
 use uuid::Uuid;
@@ -25,9 +26,30 @@ fn db_cache() -> &'static Mutex<HashMap<String, CachedDb>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 解析本地数据库保存路径
+fn resolve_local_db_path(target_path: Option<String>, uuid_str: &str) -> String {
+    if let Some(path) = target_path {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let local_dir = std::env::temp_dir();
+    let local_filename = format!("remote_tool_cache_{}.db", uuid_str);
+    local_dir.join(local_filename).to_string_lossy().to_string()
+}
+
+/// 判断路径是否位于系统临时目录（仅用于安全清理）
+fn is_temp_cache_path(path: &str) -> bool {
+    let tmp = std::env::temp_dir();
+    Path::new(path).starts_with(&tmp)
+}
+
 /// 同步远程数据库到本地缓存，返回本地文件路径
 pub async fn sync_database(
     db_path: String,
+    target_path: Option<String>,
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<String, String> {
     let app_handle_ref = app_handle.as_ref();
@@ -121,11 +143,9 @@ pub async fn sync_database(
         .nth(4)
         .and_then(|s| s.parse().ok());
 
-    // 本地临时目录
-    let local_dir = std::env::temp_dir();
-    let local_filename = format!("remote_tool_cache_{}.db", uuid_str);
-    let local_path = local_dir.join(&local_filename);
-    let local_path_str = local_path.to_string_lossy().to_string();
+    // 解析本地落盘路径（支持用户自定义）
+    let local_path_str = resolve_local_db_path(target_path, &uuid_str);
+    let local_path = PathBuf::from(&local_path_str);
 
     // SFTP 流式下载（分块读写，不加载整个文件到内存），带进度事件
     add_query_log(app_handle_ref, "通过 SFTP 下载数据库文件...");
@@ -203,7 +223,10 @@ pub async fn sync_database(
         let mut cache = db_cache().lock().unwrap();
         // 删除旧的缓存文件
         if let Some(old) = cache.remove(&db_path) {
-            let _ = std::fs::remove_file(&old.local_path);
+            // 仅自动清理临时目录缓存文件，避免误删用户自定义路径文件
+            if is_temp_cache_path(&old.local_path) && old.local_path != local_path_str {
+                let _ = std::fs::remove_file(&old.local_path);
+            }
         }
         cache.insert(db_path.clone(), CachedDb {
             local_path: local_path_str.clone(),
@@ -218,11 +241,67 @@ pub async fn sync_database(
 
 /// 获取已缓存的数据库本地路径
 fn get_cached_db_path(remote_db_path: &str) -> Result<String, String> {
+    // 如果传入路径本身就是有效本地文件，直接使用（支持本地导入场景）
+    if Path::new(remote_db_path).is_file() {
+        return Ok(remote_db_path.to_string());
+    }
+
     let cache = db_cache().lock().unwrap();
     cache
         .get(remote_db_path)
         .map(|c| c.local_path.clone())
         .ok_or_else(|| "数据库尚未同步，请先点击「同步数据库」".to_string())
+}
+
+/// 校验数据库是否包含导出所需关键表
+fn validate_database_schema(table_names: Vec<String>) -> Result<(), String> {
+    let has_wide = table_names.iter().any(|t| t == "data_wide");
+    let has_demand = table_names.iter().any(|t| t == "demand_results");
+
+    if has_wide || has_demand {
+        Ok(())
+    } else {
+        Err("数据库缺少可用数据表（需要 data_wide 或 demand_results）".to_string())
+    }
+}
+
+/// 校验本地数据库文件可用性（导入前使用）
+pub async fn validate_local_database(path: String) -> Result<(), String> {
+    let path_obj = Path::new(&path);
+    if !path_obj.exists() {
+        return Err("数据库文件不存在，请重新选择".to_string());
+    }
+    if !path_obj.is_file() {
+        return Err("所选路径不是数据库文件".to_string());
+    }
+
+    let path_clone = path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path_clone,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("打开数据库失败: {}", e))?;
+
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .map_err(|e| format!("读取数据库结构失败: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("查询数据表失败: {}", e))?;
+
+        let mut tables: Vec<String> = Vec::new();
+        for row in rows {
+            tables.push(row.map_err(|e| format!("读取数据表失败: {}", e))?);
+        }
+
+        validate_database_schema(tables)
+    })
+    .await
+    .map_err(|e| format!("执行数据库校验线程失败: {}", e))??;
+
+    Ok(())
 }
 
 /// 清除所有数据库缓存
@@ -712,6 +791,35 @@ fn sqlite_value_to_csv_field(val: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => f.to_string(),
         rusqlite::types::Value::Text(s) => s.clone(),
         rusqlite::types::Value::Blob(b) => format!("[BLOB {} bytes]", b.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_local_db_path, validate_database_schema};
+
+    #[test]
+    fn should_prefer_target_path_when_provided() {
+        let resolved = resolve_local_db_path(Some("/tmp/custom.db".to_string()), "abc123");
+        assert_eq!(resolved, "/tmp/custom.db");
+    }
+
+    #[test]
+    fn should_fallback_to_temp_path_when_target_empty() {
+        let resolved = resolve_local_db_path(Some("  ".to_string()), "abc123");
+        assert!(resolved.ends_with("remote_tool_cache_abc123.db"));
+    }
+
+    #[test]
+    fn should_fail_when_required_tables_missing() {
+        let err = validate_database_schema(vec!["sqlite_sequence".to_string()]).unwrap_err();
+        assert!(err.contains("data_wide") || err.contains("demand_results"));
+    }
+
+    #[test]
+    fn should_pass_when_has_supported_tables() {
+        assert!(validate_database_schema(vec!["data_wide".to_string()]).is_ok());
+        assert!(validate_database_schema(vec!["demand_results".to_string()]).is_ok());
     }
 }
 

@@ -110,8 +110,14 @@ pub async fn export_demand_results_direct(
 pub async fn sync_database(
     app: tauri::AppHandle,
     db_path: String,
+    target_path: Option<String>,
 ) -> Result<String, String> {
-    crate::query::sync_database(db_path, Some(app)).await
+    crate::query::sync_database(db_path, target_path, Some(app)).await
+}
+
+#[tauri::command]
+pub async fn validate_local_database(path: String) -> Result<(), String> {
+    crate::query::validate_local_database(path).await
 }
 
 #[tauri::command]
