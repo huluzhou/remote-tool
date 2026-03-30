@@ -192,7 +192,24 @@ const handleSync = () => {
     alert("请先设置同步落盘路径");
     return;
   }
-  queryStore.syncDatabase(remoteDbPath.value, syncTargetPath.value);
+
+  const startTime = parseDateTimeToSeconds(startDateTimeText.value);
+  const endTime = parseDateTimeToSeconds(endDateTimeText.value);
+  if (!startTime || !endTime) {
+    alert("请先输入有效的开始/结束时间，再按时间范围同步数据库");
+    return;
+  }
+  if (startTime > endTime) {
+    alert("开始时间不能晚于结束时间");
+    return;
+  }
+
+  queryStore.syncDatabase({
+    dbPath: remoteDbPath.value,
+    targetPath: syncTargetPath.value,
+    startTime,
+    endTime,
+  });
 };
 
 const queryType = ref<"wide_table" | "demand">("wide_table");

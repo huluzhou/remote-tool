@@ -46,92 +46,199 @@ fn is_temp_cache_path(path: &str) -> bool {
     Path::new(path).starts_with(&tmp)
 }
 
+/// 规范化同步时间范围（秒级时间戳）
+fn normalize_sync_range(start_time: Option<i64>, end_time: Option<i64>) -> Result<Option<(i64, i64)>, String> {
+    match (start_time, end_time) {
+        (Some(start), Some(end)) => {
+            if start > end {
+                return Err("同步失败：开始时间不能晚于结束时间".to_string());
+            }
+            Ok(Some((start, end)))
+        }
+        (None, None) => Ok(None),
+        _ => Err("同步失败：必须同时提供开始时间和结束时间".to_string()),
+    }
+}
+
+/// 单引号安全转义（用于远程 shell 命令）
+#[cfg(test)]
+fn quote_shell_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// 单引号转义（用于嵌入 Python 单引号字符串）
+fn quote_python_single(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// 构造“按时间范围生成子库”的远程 Python 命令（单行 -c，兼容不支持多行命令的 SSH 网关）
+fn build_range_snapshot_command(
+    db_path: &str,
+    remote_tmp: &str,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    range_start_s: i64,
+    range_end_s: i64,
+) -> String {
+    let db_path_py = quote_python_single(db_path);
+    let remote_tmp_py = quote_python_single(remote_tmp);
+    format!(
+        "python3 -c \"import os,sqlite3,sys; src_path='{db_path}'; dst_path='{remote_tmp}'; os.path.exists(dst_path) and os.remove(dst_path); \
+dst=sqlite3.connect(dst_path); dst.execute('ATTACH DATABASE ? AS srcdb', (src_path,)); \
+cur=dst.cursor(); tables={{row[0] for row in cur.execute('SELECT name FROM srcdb.sqlite_master WHERE type=\\'table\\'')}}; \
+has_wide=('data_wide' in tables); has_demand=('demand_results' in tables); \
+has_wide and dst.execute('CREATE TABLE data_wide AS SELECT * FROM srcdb.data_wide WHERE local_timestamp >= ? AND local_timestamp <= ?', ({range_start_ms}, {range_end_ms})); \
+has_demand and dst.execute('CREATE TABLE demand_results AS SELECT * FROM srcdb.demand_results WHERE timestamp >= ? AND timestamp <= ?', ({range_start_s}, {range_end_s})); \
+dst.commit(); dst.execute('DETACH DATABASE srcdb'); dst.close(); \
+print('ok' if (has_wide or has_demand) else ('missing_tables:' + ','.join(sorted(tables))))\"",
+        db_path = db_path_py,
+        remote_tmp = remote_tmp_py,
+        range_start_ms = range_start_ms,
+        range_end_ms = range_end_ms,
+        range_start_s = range_start_s,
+        range_end_s = range_end_s
+    )
+}
+
 /// 同步远程数据库到本地缓存，返回本地文件路径
 pub async fn sync_database(
     db_path: String,
     target_path: Option<String>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<String, String> {
     let app_handle_ref = app_handle.as_ref();
     add_query_log(app_handle_ref, &format!("开始同步数据库: {}", db_path));
+    let sync_range = normalize_sync_range(start_time, end_time)?;
 
     // 生成远程临时文件路径
     let mut uuid_buf = [0u8; 32];
     let uuid_str = Uuid::new_v4().simple().encode_lower(&mut uuid_buf).to_string();
     let remote_tmp = format!("/tmp/remote_tool_backup_{}.db", uuid_str);
 
-    // 三级备份策略：sqlite3 .backup → python sqlite3.backup → cp + WAL
-    // 以验证结果为准，不信任 exit_code（JumpServer 可能返回假成功）
     let verify_cmd = format!("ls -l \"{}\" 2>&1", remote_tmp);
     let mut used_cp_fallback = false;
     let mut file_info: String;
-
-    // 第 1 级：sqlite3 .backup
-    add_query_log(app_handle_ref, "尝试使用 sqlite3 .backup 创建数据库快照...");
-    let backup_cmd = format!("sqlite3 \"{}\" \".backup '{}'\"", db_path, remote_tmp);
-    let _ = SshClient::execute_command(&backup_cmd)
-        .await
-        .map_err(|e| format!("执行远程备份命令失败: {}", e))?;
-
-    let (verify_exit, file_info_temp, _) = SshClient::execute_command(&verify_cmd)
-        .await
-        .map_err(|e| format!("验证远程文件失败: {}", e))?;
-    file_info = file_info_temp;
-    let mut need_next = verify_exit != 0 || file_info.contains("No such file");
-
-    if need_next {
-        // 第 2 级：Python sqlite3.Connection.backup()
-        add_query_log(app_handle_ref, "备份文件未生成，尝试 Python backup...");
-        let py_backup_cmd = format!(
-            "python3 -c \"import sqlite3; s=sqlite3.connect('{}'); d=sqlite3.connect('{}'); s.backup(d); d.close(); s.close(); print('ok')\"",
-            db_path, remote_tmp
+    if let Some((range_start, range_end)) = sync_range {
+        let range_start_ms = range_start * 1000;
+        let range_end_ms = range_end * 1000;
+        add_query_log(
+            app_handle_ref,
+            &format!(
+                "按时间范围同步数据库: {} ~ {}（秒级）",
+                range_start, range_end
+            ),
         );
-        let (py_exit, py_stdout, py_stderr) = SshClient::execute_command(&py_backup_cmd)
-            .await
-            .map_err(|e| format!("执行 Python 备份命令失败: {}", e))?;
+        add_query_log(app_handle_ref, "远程生成时间范围子库快照...");
 
-        if py_exit != 0 || !py_stdout.trim().contains("ok") {
-            let py_not_found = py_stderr.to_lowercase().contains("command not found")
-                || py_stderr.to_lowercase().contains("not found")
-                || py_stderr.to_lowercase().contains("no module");
-            if py_not_found {
-                add_query_log(app_handle_ref, "Python 不可用，使用 cp 复制...");
-            } else {
-                add_query_log(app_handle_ref, &format!("Python 备份失败({}), 使用 cp 复制...", py_stderr.trim()));
-            }
-        } else {
-            add_query_log(app_handle_ref, "Python sqlite3.backup 快照创建成功");
+        let py_range_cmd = build_range_snapshot_command(
+            &db_path,
+            &remote_tmp,
+            range_start_ms,
+            range_end_ms,
+            range_start,
+            range_end,
+        );
+
+        let (range_exit, range_stdout, range_stderr) = SshClient::execute_command(&py_range_cmd)
+            .await
+            .map_err(|e| format!("执行按时间范围同步失败: {}", e))?;
+        if range_exit != 0 {
+            return Err(format!(
+                "按时间范围生成子库失败（需要远程 python3 + sqlite3）: {}",
+                range_stderr.trim()
+            ));
+        }
+        if !range_stdout.trim().contains("ok") {
+            return Err(format!(
+                "按时间范围生成子库失败：未找到 data_wide 或 demand_results 表。python 输出: stdout=`{}` stderr=`{}`",
+                range_stdout.trim(),
+                range_stderr.trim()
+            ));
         }
 
-        let (v_exit, v_stdout, _) = SshClient::execute_command(&verify_cmd)
+        let (verify_exit, file_info_temp, _) = SshClient::execute_command(&verify_cmd)
             .await
             .map_err(|e| format!("验证远程文件失败: {}", e))?;
-        file_info = v_stdout;
-        need_next = v_exit != 0 || file_info.contains("No such file");
+        if verify_exit != 0 || file_info_temp.contains("No such file") {
+            return Err(format!(
+                "按时间范围生成子库失败。python 输出: stdout=`{}` stderr=`{}`；ls 输出: {}",
+                range_stdout.trim(),
+                range_stderr.trim(),
+                file_info_temp.trim()
+            ));
+        }
+        file_info = file_info_temp;
+    } else {
+        // 全量同步时使用三级备份策略：sqlite3 .backup → python sqlite3.backup → cp + WAL
+        // 以验证结果为准，不信任 exit_code（JumpServer 可能返回假成功）
+        add_query_log(app_handle_ref, "尝试使用 sqlite3 .backup 创建数据库快照...");
+        let backup_cmd = format!("sqlite3 \"{}\" \".backup '{}'\"", db_path, remote_tmp);
+        let _ = SshClient::execute_command(&backup_cmd)
+            .await
+            .map_err(|e| format!("执行远程备份命令失败: {}", e))?;
+
+        let (verify_exit, file_info_temp, _) = SshClient::execute_command(&verify_cmd)
+            .await
+            .map_err(|e| format!("验证远程文件失败: {}", e))?;
+        file_info = file_info_temp;
+        let mut need_next = verify_exit != 0 || file_info.contains("No such file");
 
         if need_next {
-            // 第 3 级：cp + WAL/SHM
-            add_query_log(app_handle_ref, "备份文件未生成，使用 cp 复制...");
-            used_cp_fallback = true;
-            let cp_cmd = format!(
-                "cp \"{}\" \"{}\" && cp \"{}-wal\" \"{}-wal\" 2>/dev/null; cp \"{}-shm\" \"{}-shm\" 2>/dev/null; true",
-                db_path, remote_tmp,
-                db_path, remote_tmp,
+            // 第 2 级：Python sqlite3.Connection.backup()
+            add_query_log(app_handle_ref, "备份文件未生成，尝试 Python backup...");
+            let py_backup_cmd = format!(
+                "python3 -c \"import sqlite3; s=sqlite3.connect('{}'); d=sqlite3.connect('{}'); s.backup(d); d.close(); s.close(); print('ok')\"",
                 db_path, remote_tmp
             );
-            let (cp_exit, _, cp_stderr) = SshClient::execute_command(&cp_cmd)
+            let (py_exit, py_stdout, py_stderr) = SshClient::execute_command(&py_backup_cmd)
                 .await
-                .map_err(|e| format!("执行远程复制命令失败: {}", e))?;
-            if cp_exit != 0 {
-                return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
+                .map_err(|e| format!("执行 Python 备份命令失败: {}", e))?;
+
+            if py_exit != 0 || !py_stdout.trim().contains("ok") {
+                let py_not_found = py_stderr.to_lowercase().contains("command not found")
+                    || py_stderr.to_lowercase().contains("not found")
+                    || py_stderr.to_lowercase().contains("no module");
+                if py_not_found {
+                    add_query_log(app_handle_ref, "Python 不可用，使用 cp 复制...");
+                } else {
+                    add_query_log(app_handle_ref, &format!("Python 备份失败({}), 使用 cp 复制...", py_stderr.trim()));
+                }
+            } else {
+                add_query_log(app_handle_ref, "Python sqlite3.backup 快照创建成功");
             }
-            let (v2_exit, v2_stdout, _) = SshClient::execute_command(&verify_cmd)
+
+            let (v_exit, v_stdout, _) = SshClient::execute_command(&verify_cmd)
                 .await
                 .map_err(|e| format!("验证远程文件失败: {}", e))?;
-            if v2_exit != 0 || v2_stdout.contains("No such file") {
-                return Err(format!("远程数据库文件无法创建。ls 输出: {}", v2_stdout.trim()));
+            file_info = v_stdout;
+            need_next = v_exit != 0 || file_info.contains("No such file");
+
+            if need_next {
+                // 第 3 级：cp + WAL/SHM
+                add_query_log(app_handle_ref, "备份文件未生成，使用 cp 复制...");
+                used_cp_fallback = true;
+                let cp_cmd = format!(
+                    "cp \"{}\" \"{}\" && cp \"{}-wal\" \"{}-wal\" 2>/dev/null; cp \"{}-shm\" \"{}-shm\" 2>/dev/null; true",
+                    db_path, remote_tmp,
+                    db_path, remote_tmp,
+                    db_path, remote_tmp
+                );
+                let (cp_exit, _, cp_stderr) = SshClient::execute_command(&cp_cmd)
+                    .await
+                    .map_err(|e| format!("执行远程复制命令失败: {}", e))?;
+                if cp_exit != 0 {
+                    return Err(format!("远程复制数据库文件失败: {}", cp_stderr.trim()));
+                }
+                let (v2_exit, v2_stdout, _) = SshClient::execute_command(&verify_cmd)
+                    .await
+                    .map_err(|e| format!("验证远程文件失败: {}", e))?;
+                if v2_exit != 0 || v2_stdout.contains("No such file") {
+                    return Err(format!("远程数据库文件无法创建。ls 输出: {}", v2_stdout.trim()));
+                }
+                file_info = v2_stdout;
             }
-            file_info = v2_stdout;
         }
     }
 
@@ -796,7 +903,7 @@ fn sqlite_value_to_csv_field(val: &rusqlite::types::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_local_db_path, validate_database_schema};
+    use super::{build_range_snapshot_command, normalize_sync_range, quote_python_single, quote_shell_single, resolve_local_db_path, validate_database_schema};
 
     #[test]
     fn should_prefer_target_path_when_provided() {
@@ -820,6 +927,56 @@ mod tests {
     fn should_pass_when_has_supported_tables() {
         assert!(validate_database_schema(vec!["data_wide".to_string()]).is_ok());
         assert!(validate_database_schema(vec!["demand_results".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn should_accept_valid_sync_range() {
+        let result = normalize_sync_range(Some(100), Some(200)).unwrap();
+        assert_eq!(result, Some((100, 200)));
+    }
+
+    #[test]
+    fn should_reject_incomplete_sync_range() {
+        let err = normalize_sync_range(Some(100), None).unwrap_err();
+        assert!(err.contains("同时提供"));
+    }
+
+    #[test]
+    fn should_reject_invalid_sync_range() {
+        let err = normalize_sync_range(Some(200), Some(100)).unwrap_err();
+        assert!(err.contains("开始时间"));
+    }
+
+    #[test]
+    fn should_quote_single_quote_for_shell() {
+        let quoted = quote_shell_single("/tmp/a'b.db");
+        assert_eq!(quoted, "'/tmp/a'\"'\"'b.db'");
+    }
+
+    #[test]
+    fn should_escape_single_quote_for_python() {
+        let escaped = quote_python_single("/mnt/a'b\\c.db");
+        assert_eq!(escaped, "/mnt/a\\'b\\\\c.db");
+    }
+
+    #[test]
+    fn should_build_range_snapshot_command_with_single_line_python() {
+        let cmd = build_range_snapshot_command(
+            "/mnt/data/device_data.db",
+            "/tmp/out.db",
+            1000,
+            2000,
+            10,
+            20,
+        );
+        assert!(cmd.contains("python3 -c \""));
+        assert!(cmd.contains("src_path='/mnt/data/device_data.db'"));
+        assert!(cmd.contains("dst_path='/tmp/out.db'"));
+        assert!(cmd.contains("ATTACH DATABASE ? AS srcdb"));
+        assert!(cmd.contains("FROM srcdb.data_wide"));
+        assert!(cmd.contains("FROM srcdb.demand_results"));
+        assert!(cmd.contains("(1000, 2000)"));
+        assert!(cmd.contains("(10, 20)"));
     }
 }
 
