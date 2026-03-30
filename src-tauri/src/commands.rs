@@ -111,8 +111,10 @@ pub async fn sync_database(
     app: tauri::AppHandle,
     db_path: String,
     target_path: Option<String>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
 ) -> Result<String, String> {
-    crate::query::sync_database(db_path, target_path, Some(app)).await
+    crate::query::sync_database(db_path, target_path, start_time, end_time, Some(app)).await
 }
 
 #[tauri::command]

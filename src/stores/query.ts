@@ -10,6 +10,13 @@ export interface QueryParams {
   endTime: number;
 }
 
+export interface SyncDatabaseParams {
+  dbPath: string;
+  targetPath?: string;
+  startTime?: number;
+  endTime?: number;
+}
+
 export type SourceMode = "remote_sync" | "local_import";
 
 interface QuerySourceConfig {
@@ -257,7 +264,7 @@ export const useQueryStore = defineStore("query", {
       }
     },
 
-    async syncDatabase(dbPath: string, targetPath?: string): Promise<void> {
+    async syncDatabase(params: SyncDatabaseParams): Promise<void> {
       this.syncing = true;
       this.error = null;
       this.logs = [];
@@ -281,8 +288,10 @@ export const useQueryStore = defineStore("query", {
 
       try {
         const syncedPath = await invoke<string>("sync_database", {
-          dbPath,
-          targetPath: targetPath || this.syncTargetPath || null,
+          dbPath: params.dbPath,
+          targetPath: params.targetPath || this.syncTargetPath || null,
+          startTime: params.startTime ?? null,
+          endTime: params.endTime ?? null,
         });
         this.dbSynced = true;
         this.dbSyncTime = new Date().toLocaleTimeString("zh-CN", {
