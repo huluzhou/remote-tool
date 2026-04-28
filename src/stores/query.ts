@@ -22,7 +22,6 @@ export type SourceMode = "remote_sync" | "local_import";
 interface QuerySourceConfig {
   sourceMode: SourceMode;
   remoteDbPath: string;
-  syncTargetPath: string;
   importedDbPath: string;
   activeDbPath: string;
   lastReadyAt: string | null;
@@ -55,7 +54,6 @@ const defaultRemoteDbPath = "/mnt/analysis/data/device_data.db";
 const defaultSourceConfig: QuerySourceConfig = {
   sourceMode: "remote_sync",
   remoteDbPath: defaultRemoteDbPath,
-  syncTargetPath: "",
   importedDbPath: "",
   activeDbPath: "",
   lastReadyAt: null,
@@ -95,7 +93,8 @@ export const useQueryStore = defineStore("query", {
     syncProgressMessage: "",
     sourceMode: defaultSourceConfig.sourceMode as SourceMode,
     remoteDbPath: defaultSourceConfig.remoteDbPath,
-    syncTargetPath: defaultSourceConfig.syncTargetPath,
+    // 同步落盘路径仅在当前会话内有效，应用重启后必须重新选择
+    syncTargetPath: "",
     importedDbPath: defaultSourceConfig.importedDbPath,
     activeDbPath: defaultSourceConfig.activeDbPath,
     lastReadyAt: defaultSourceConfig.lastReadyAt,
@@ -106,7 +105,8 @@ export const useQueryStore = defineStore("query", {
       const config = loadSourceConfigFromStorage();
       this.sourceMode = config.sourceMode;
       this.remoteDbPath = config.remoteDbPath;
-      this.syncTargetPath = config.syncTargetPath;
+      // 强制清空持久化路径，避免重启后误覆盖历史文件
+      this.syncTargetPath = "";
       this.importedDbPath = config.importedDbPath;
       this.activeDbPath = config.activeDbPath;
       this.lastReadyAt = config.lastReadyAt;
@@ -116,7 +116,6 @@ export const useQueryStore = defineStore("query", {
       const config: QuerySourceConfig = {
         sourceMode: this.sourceMode,
         remoteDbPath: this.remoteDbPath,
-        syncTargetPath: this.syncTargetPath,
         importedDbPath: this.importedDbPath,
         activeDbPath: this.activeDbPath,
         lastReadyAt: this.lastReadyAt,

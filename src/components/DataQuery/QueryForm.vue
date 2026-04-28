@@ -182,13 +182,14 @@ onMounted(async () => {
   }
 });
 
-const handleSync = () => {
+const handleSync = async () => {
   if (syncing.value || !sshConnected.value) return;
   if (!remoteDbPath.value.trim()) {
     alert("请先填写远程数据库路径");
     return;
   }
-  if (!syncTargetPath.value.trim()) {
+  const ensuredTargetPath = await ensureSyncTargetPath();
+  if (!ensuredTargetPath) {
     alert("请先设置同步落盘路径");
     return;
   }
@@ -206,7 +207,7 @@ const handleSync = () => {
 
   queryStore.syncDatabase({
     dbPath: remoteDbPath.value,
-    targetPath: syncTargetPath.value,
+    targetPath: ensuredTargetPath,
     startTime,
     endTime,
   });
@@ -217,7 +218,7 @@ const queryType = ref<"wide_table" | "demand">("wide_table");
 const startDateTimeText = ref("");
 const endDateTimeText = ref("");
 
-const pickSyncTargetPath = async () => {
+const pickSyncTargetPath = async (): Promise<string | null> => {
   const selected = await save({
     filters: [
       {
@@ -228,8 +229,17 @@ const pickSyncTargetPath = async () => {
     defaultPath: queryStore.syncTargetPath || "device_data.db",
   });
 
-  if (!selected) return;
+  if (!selected) return null;
   queryStore.setSyncTargetPath(selected);
+  return selected;
+};
+
+const ensureSyncTargetPath = async (): Promise<string> => {
+  const currentPath = syncTargetPath.value.trim();
+  if (currentPath) {
+    return currentPath;
+  }
+  return (await pickSyncTargetPath())?.trim() ?? "";
 };
 
 const importLocalDatabase = async () => {
