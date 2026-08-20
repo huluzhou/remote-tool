@@ -1,6 +1,6 @@
 <template>
   <div class="query-form">
-    <h3>{{ queryType === 'wide_table' ? '导出宽表数据' : '导出需量数据' }}</h3>
+    <h3>{{ formTitle }}</h3>
     <form @submit.prevent="handleSubmit">
       <div class="form-group">
         <label>数据库来源:</label>
@@ -41,6 +41,14 @@
               v-model="queryType"
             />
             需量查询
+          </label>
+          <label>
+            <input
+              type="radio"
+              value="aggregate"
+              v-model="queryType"
+            />
+            聚合查询（15min）
           </label>
         </div>
       </div>
@@ -84,6 +92,43 @@
             <div
               class="progress-fill"
               :style="{ width: `${queryStore.syncProgress}%` }"
+            />
+          </div>
+          <span class="progress-text">{{ queryStore.syncProgressMessage }}</span>
+        </div>
+      </div>
+      <div v-if="sourceMode === 'remote_sync' && queryType === 'aggregate'" class="form-group">
+        <label>聚合库落盘路径:</label>
+        <div class="time-input-group">
+          <input
+            v-model="aggSyncTargetPath"
+            type="text"
+            placeholder="请选择本地聚合库保存路径（*.db）"
+            required
+          />
+          <button type="button" @click="pickAggSyncTargetPath">选择路径</button>
+        </div>
+        <p class="agg-hint">聚合库为宽表的 15 分钟粒度长期聚合（{{ remoteDbPath }}.agg.db），宽表保留期外的历史数据请从聚合库导出</p>
+      </div>
+      <div v-if="sourceMode === 'remote_sync' && queryType === 'aggregate'" class="form-group sync-group">
+        <div class="sync-controls">
+          <button
+            type="button"
+            class="sync-btn"
+            :disabled="syncing || !sshConnected"
+            @click="handleAggSync"
+          >
+            {{ syncing ? '同步中...' : '同步聚合库' }}
+          </button>
+          <span class="sync-status" :class="{ synced: queryStore.aggDbSynced }">
+            {{ queryStore.aggDbSynced ? '已同步 (' + queryStore.aggDbSyncTime + ')' : '未同步' }}
+          </span>
+        </div>
+        <div v-if="syncing" class="sync-progress">
+          <div class="progress-bar">
+            <div
+              class="progress-fill"
+              :style="{ width: queryStore.syncProgress + '%' }"
             />
           </div>
           <span class="progress-text">{{ queryStore.syncProgressMessage }}</span>
@@ -143,7 +188,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, watch } from "vue";
 import { useQueryStore, type SourceMode } from "../../stores/query";
 import { useSshStore } from "../../stores/ssh";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -213,7 +258,85 @@ const handleSync = async () => {
   });
 };
 
-const queryType = ref<"wide_table" | "demand">("wide_table");
+const queryType = ref<"wide_table" | "demand" | "aggregate">("wide_table");
+
+const formTitle = computed(() => {
+  if (queryType.value === "demand") return "导出需量数据";
+  if (queryType.value === "aggregate") return "导出聚合数据（15min 粒度）";
+  return "导出宽表数据";
+});
+
+// 同步聚合库后自动切换活动库类型，联动查询类型
+watch(
+  () => queryStore.activeDbKind,
+  (kind) => {
+    if (kind === "aggregate") {
+      queryType.value = "aggregate";
+    } else if (queryType.value === "aggregate") {
+      queryType.value = "wide_table";
+    }
+  }
+);
+
+const aggSyncTargetPath = computed({
+  get: () => queryStore.aggSyncTargetPath,
+  set: (value) => queryStore.setAggSyncTargetPath(value),
+});
+
+const pickAggSyncTargetPath = async (): Promise<string | null> => {
+  const selected = await save({
+    filters: [
+      {
+        name: "SQLite",
+        extensions: ["db"],
+      },
+    ],
+    defaultPath: queryStore.aggSyncTargetPath || "device_data.agg.db",
+  });
+
+  if (!selected) return null;
+  queryStore.setAggSyncTargetPath(selected);
+  return selected;
+};
+
+const ensureAggSyncTargetPath = async (): Promise<string> => {
+  const currentPath = aggSyncTargetPath.value.trim();
+  if (currentPath) {
+    return currentPath;
+  }
+  return (await pickAggSyncTargetPath())?.trim() ?? "";
+};
+
+const handleAggSync = async () => {
+  if (syncing.value || !sshConnected.value) return;
+  if (!remoteDbPath.value.trim()) {
+    alert("请先填写远程数据库路径");
+    return;
+  }
+  const ensuredTargetPath = await ensureAggSyncTargetPath();
+  if (!ensuredTargetPath) {
+    alert("请先设置聚合库落盘路径");
+    return;
+  }
+
+  const startTime = parseDateTimeToSeconds(startDateTimeText.value);
+  const endTime = parseDateTimeToSeconds(endDateTimeText.value);
+  if (!startTime || !endTime) {
+    alert("请先输入有效的开始/结束时间，再按时间范围同步聚合库");
+    return;
+  }
+  if (startTime > endTime) {
+    alert("开始时间不能晚于结束时间");
+    return;
+  }
+
+  queryStore.syncAggregateDatabase({
+    dbPath: remoteDbPath.value,
+    targetPath: ensuredTargetPath,
+    startTime,
+    endTime,
+  });
+};
 
 const startDateTimeText = ref("");
 const endDateTimeText = ref("");
@@ -441,6 +564,13 @@ setTimeRange("7days");
   padding: 0.5rem 1rem;
   font-size: 0.875rem;
   background-color: rgba(255, 255, 255, 0.1);
+}
+
+.agg-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.55);
+  word-break: break-all;
 }
 
 .sync-group {

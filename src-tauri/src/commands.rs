@@ -93,6 +93,20 @@ pub struct ExportDemandResultsParams {
 }
 
 #[tauri::command]
+pub async fn export_aggregate_direct(
+    app: tauri::AppHandle,
+    params: ExportWideTableParams,
+) -> Result<usize, String> {
+    crate::query::export_aggregate_direct(
+        params.db_path,
+        params.start_time,
+        params.end_time,
+        params.output_path,
+        Some(app),
+    ).await
+}
+
+#[tauri::command]
 pub async fn export_demand_results_direct(
     app: tauri::AppHandle,
     params: ExportDemandResultsParams,
@@ -104,6 +118,17 @@ pub async fn export_demand_results_direct(
         params.output_path,
         Some(app),
     ).await
+}
+
+#[tauri::command]
+pub async fn sync_aggregate_database(
+    app: tauri::AppHandle,
+    db_path: String,
+    target_path: Option<String>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+) -> Result<String, String> {
+    crate::query::sync_aggregate_database(db_path, target_path, start_time, end_time, Some(app)).await
 }
 
 #[tauri::command]

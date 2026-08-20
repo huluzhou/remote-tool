@@ -2,7 +2,9 @@
 
 本文档面向使用打包后的可执行文件的用户，介绍如何使用图形界面进行数据查询和导出。
 
-> **注意**：本工具仅支持查询 `data_wide` 宽表，不再支持旧表（device_data、cmd_data）的查询。
+> **注意**：本工具支持查询 `data_wide` 宽表、`demand_results` 需量表和聚合库 `forecast_aggregate_wide_15m`（15 分钟粒度聚合宽表），不再支持旧表（device_data、cmd_data）的查询。
+>
+> **聚合库**：宽表数据保留期缩短后，长时间跨度的历史数据保存在聚合库（远程路径为主库加 `.agg.db` 后缀，由采集器的 forecast_wide_aggregation 生成）。查询类型选择「聚合查询（15min）」后，先点击「同步聚合库」按时间范围拉取聚合数据，再导出 CSV。需要远程服务器具备 python3 + sqlite3。
 
 ## 目录
 

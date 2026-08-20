@@ -71,6 +71,31 @@ fn quote_python_single(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// 聚合结果表名（15 分钟粒度，来自 analysis-collector 的 forecast_aggregation）
+pub const AGGREGATE_TABLE: &str = "forecast_aggregate_wide_15m";
+/// 聚合库远程路径后缀：{device_data.db}.agg.db
+pub const AGG_DB_SUFFIX: &str = ".agg.db";
+
+/// 构造“按时间范围生成聚合库子库”的远程 Python 命令（单行 -c）
+/// 聚合表主键为 bucket_start_ms（毫秒），直接按主键范围筛选
+fn build_agg_range_snapshot_command(
+    db_path: &str,
+    remote_tmp: &str,
+    range_start_ms: i64,
+    range_end_ms: i64,
+) -> String {
+    let db_path_py = quote_python_single(db_path);
+    let remote_tmp_py = quote_python_single(remote_tmp);
+    format!(
+        "python3 -c \"import os,sqlite3,sys; src_path='{db_path}'; dst_path='{remote_tmp}'; os.path.exists(dst_path) and os.remove(dst_path); dst=sqlite3.connect(dst_path); dst.execute('ATTACH DATABASE ? AS srcdb', (src_path,)); cur=dst.cursor(); tables={{row[0] for row in cur.execute('SELECT name FROM srcdb.sqlite_master WHERE type=\'table\'')}}; has_agg=('{agg_table}' in tables); has_agg and dst.execute('CREATE TABLE {agg_table} AS SELECT * FROM srcdb.{agg_table} WHERE bucket_start_ms >= ? AND bucket_start_ms <= ?', ({range_start_ms}, {range_end_ms})); dst.commit(); dst.execute('DETACH DATABASE srcdb'); dst.close(); print('ok' if has_agg else ('missing_tables:' + ','.join(sorted(tables))))\"",
+        db_path = db_path_py,
+        remote_tmp = remote_tmp_py,
+        agg_table = AGGREGATE_TABLE,
+        range_start_ms = range_start_ms,
+        range_end_ms = range_end_ms
+    )
+}
+
 /// 构造“按时间范围生成子库”的远程 Python 命令（单行 -c，兼容不支持多行命令的 SSH 网关）
 fn build_range_snapshot_command(
     db_path: &str,
@@ -100,7 +125,7 @@ print('ok' if (has_wide or has_demand) else ('missing_tables:' + ','.join(sorted
     )
 }
 
-/// 同步远程数据库到本地缓存，返回本地文件路径
+/// 同步远程主数据库（宽表 + 需量）到本地，返回本地文件路径
 pub async fn sync_database(
     db_path: String,
     target_path: Option<String>,
@@ -108,8 +133,60 @@ pub async fn sync_database(
     end_time: Option<i64>,
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<String, String> {
+    sync_database_internal(db_path, target_path, start_time, end_time, false, app_handle).await
+}
+
+/// 同步远程聚合库（{device_data.db}.agg.db，15 分钟粒度宽表聚合）到本地。
+/// 宽表保留期缩短后，长时间跨度的历史数据从聚合库获取。
+pub async fn sync_aggregate_database(
+    db_path: String,
+    target_path: Option<String>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    app_handle: Option<tauri::AppHandle>,
+) -> Result<String, String> {
+    let agg_remote_path = format!("{}{}", db_path.trim_end(), AGG_DB_SUFFIX);
     let app_handle_ref = app_handle.as_ref();
-    add_query_log(app_handle_ref, &format!("开始同步数据库: {}", db_path));
+    add_query_log(app_handle_ref, &format!("开始同步聚合库: {}", agg_remote_path));
+
+    // 聚合库存在性预检查（旧版本采集器未启用聚合时不会有该文件）
+    let check_cmd = format!("ls -l \"{}\" 2>&1", agg_remote_path);
+    let (check_exit, check_out, _) = SshClient::execute_command(&check_cmd)
+        .await
+        .map_err(|e| format!("检查远程聚合库失败: {}", e))?;
+    if check_exit != 0 || check_out.contains("No such file") {
+        return Err(format!(
+            "远程聚合库不存在: {}（需要采集器启用 forecast_wide_aggregation 后才会生成）",
+            agg_remote_path
+        ));
+    }
+
+    sync_database_internal(
+        agg_remote_path,
+        target_path,
+        start_time,
+        end_time,
+        true,
+        app_handle,
+    )
+    .await
+}
+
+/// 同步远程数据库到本地缓存，返回本地文件路径。
+/// agg_mode=true 时同步聚合库（forecast_aggregate_wide_15m 表）。
+#[allow(clippy::too_many_arguments)]
+async fn sync_database_internal(
+    db_path: String,
+    target_path: Option<String>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    agg_mode: bool,
+    app_handle: Option<tauri::AppHandle>,
+) -> Result<String, String> {
+    let app_handle_ref = app_handle.as_ref();
+    if !agg_mode {
+        add_query_log(app_handle_ref, &format!("开始同步数据库: {}", db_path));
+    }
     let sync_range = normalize_sync_range(start_time, end_time)?;
 
     // 生成远程临时文件路径
@@ -132,14 +209,18 @@ pub async fn sync_database(
         );
         add_query_log(app_handle_ref, "远程生成时间范围子库快照...");
 
-        let py_range_cmd = build_range_snapshot_command(
-            &db_path,
-            &remote_tmp,
-            range_start_ms,
-            range_end_ms,
-            range_start,
-            range_end,
-        );
+        let py_range_cmd = if agg_mode {
+            build_agg_range_snapshot_command(&db_path, &remote_tmp, range_start_ms, range_end_ms)
+        } else {
+            build_range_snapshot_command(
+                &db_path,
+                &remote_tmp,
+                range_start_ms,
+                range_end_ms,
+                range_start,
+                range_end,
+            )
+        };
 
         let (range_exit, range_stdout, range_stderr) = SshClient::execute_command(&py_range_cmd)
             .await
@@ -151,8 +232,14 @@ pub async fn sync_database(
             ));
         }
         if !range_stdout.trim().contains("ok") {
+            let missing_hint = if agg_mode {
+                format!("按时间范围生成聚合子库失败：未找到 {} 表。", AGGREGATE_TABLE)
+            } else {
+                "按时间范围生成子库失败：未找到 data_wide 或 demand_results 表。".to_string()
+            };
             return Err(format!(
-                "按时间范围生成子库失败：未找到 data_wide 或 demand_results 表。python 输出: stdout=`{}` stderr=`{}`",
+                "{}python 输出: stdout=`{}` stderr=`{}`",
+                missing_hint,
                 range_stdout.trim(),
                 range_stderr.trim()
             ));
@@ -364,11 +451,15 @@ fn get_cached_db_path(remote_db_path: &str) -> Result<String, String> {
 fn validate_database_schema(table_names: Vec<String>) -> Result<(), String> {
     let has_wide = table_names.iter().any(|t| t == "data_wide");
     let has_demand = table_names.iter().any(|t| t == "demand_results");
+    let has_agg = table_names.iter().any(|t| t == AGGREGATE_TABLE);
 
-    if has_wide || has_demand {
+    if has_wide || has_demand || has_agg {
         Ok(())
     } else {
-        Err("数据库缺少可用数据表（需要 data_wide 或 demand_results）".to_string())
+        Err(format!(
+            "数据库缺少可用数据表（需要 data_wide、demand_results 或 {}）",
+            AGGREGATE_TABLE
+        ))
     }
 }
 
@@ -496,12 +587,15 @@ pub async fn execute_query(
     add_query_log(app_handle_ref, &format!("开始查询 [{}] | 时间范围: {} - {}", 
         params.query_type, start_time_str, end_time_str));
     
-    // 只支持宽表查询
+    // 支持宽表 / 聚合宽表查询
     if params.query_type == "wide_table" {
         return execute_wide_table_query(params, app_handle).await;
     }
+    if params.query_type == "aggregate" {
+        return execute_aggregate_query(params, app_handle).await;
+    }
     
-    Err(format!("不支持的查询类型: {}，仅支持 wide_table", params.query_type))
+    Err(format!("不支持的查询类型: {}，仅支持 wide_table / aggregate", params.query_type))
 }
 
 // ============================================================
@@ -780,6 +874,186 @@ pub async fn export_demand_results_direct(
     Ok(result)
 }
 
+
+// ============================================================
+// 聚合宽表（forecast_aggregate_wide_15m）
+// ============================================================
+
+async fn execute_aggregate_query(params: QueryParams, app_handle: Option<tauri::AppHandle>) -> Result<QueryResult, String> {
+    let app_handle_ref = app_handle.as_ref();
+    
+    // 聚合表主键 bucket_start_ms 为毫秒时间戳
+    let start_time_ms = params.start_time * 1000;
+    let end_time_ms = params.end_time * 1000;
+    
+    let sql = format!(
+        "SELECT * FROM {} WHERE bucket_start_ms >= {} AND bucket_start_ms <= {} ORDER BY bucket_start_ms ASC",
+        AGGREGATE_TABLE, start_time_ms, end_time_ms
+    );
+    
+    let (results, columns) = execute_sql_query(&params.db_path, &sql, app_handle_ref).await?;
+    
+    if results.is_empty() {
+        add_query_log(app_handle_ref, "查询结果为空");
+        return Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            total_rows: 0,
+        });
+    }
+    
+    let total_rows = results.len();
+    add_query_log(app_handle_ref, &format!("聚合宽表查询完成 | {} 行 | {} 列", total_rows, columns.len()));
+    
+    Ok(QueryResult {
+        columns,
+        rows: results,
+        total_rows,
+    })
+}
+
+/// 直接导出聚合宽表数据到CSV文件（本地rusqlite查询）
+/// bucket_start_ms / bucket_end_ms 为毫秒时间戳，导出时格式化为东八区时间
+/// 返回导出的记录数
+pub async fn export_aggregate_direct(
+    db_path: String,
+    start_time: i64,
+    end_time: i64,
+    output_path: String,
+    app_handle: Option<tauri::AppHandle>,
+) -> Result<usize, String> {
+    let app_handle_ref = app_handle.as_ref();
+    
+    let start_time_str = format_gmt8_time(start_time);
+    let end_time_str = format_gmt8_time(end_time);
+    
+    add_query_log(app_handle_ref, &format!("开始导出聚合宽表数据 | 时间范围: {} - {} | 输出: {}", 
+        start_time_str, end_time_str, output_path));
+    
+    let local_db_path = get_cached_db_path(&db_path)?;
+    add_query_log(app_handle_ref, "使用本地缓存数据库查询...");
+    
+    let start_time_ms = start_time * 1000i64;
+    let end_time_ms = end_time * 1000i64;
+    let output_path_clone = output_path.clone();
+    
+    let result = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &local_db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).map_err(|e| format!("打开本地数据库失败: {}", e))?;
+        
+        check_table_exists(&conn, AGGREGATE_TABLE)?;
+        
+        let select_sql = format!(
+            "SELECT * FROM {} WHERE bucket_start_ms >= ?1 AND bucket_start_ms <= ?2 ORDER BY bucket_start_ms",
+            AGGREGATE_TABLE
+        );
+        let mut stmt = conn.prepare(&select_sql)
+            .map_err(|e| format!("准备SQL语句失败: {}", e))?;
+        
+        let column_count = stmt.column_count();
+        let columns: Vec<String> = (0..column_count)
+            .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+            .collect();
+        
+        // 毫秒时间戳列（bucket_start_ms / bucket_end_ms）格式化输出
+        let time_col_indices: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| *c == "bucket_start_ms" || *c == "bucket_end_ms")
+            .map(|(i, _)| i)
+            .collect();
+        
+        let beijing_tz = FixedOffset::east_opt(8 * 3600).unwrap();
+        
+        // 创建文件，写入UTF-8 BOM
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&output_path_clone)
+                .map_err(|e| format!("创建输出文件失败: {}", e))?;
+            file.write_all(&[0xEF, 0xBB, 0xBF])
+                .map_err(|e| format!("写入BOM失败: {}", e))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&output_path_clone)
+            .map_err(|e| format!("打开输出文件失败: {}", e))?;
+        let mut wtr = csv::WriterBuilder::new()
+            .quote_style(csv::QuoteStyle::NonNumeric)
+            .from_writer(std::io::BufWriter::new(file));
+        
+        wtr.write_record(&columns)
+            .map_err(|e| format!("写入CSV表头失败: {}", e))?;
+        
+        let mut row_count: usize = 0;
+        let rows = stmt.query_map(
+            rusqlite::params![start_time_ms, end_time_ms],
+            |row| {
+                let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    values.push(row.get::<_, rusqlite::types::Value>(i)?);
+                }
+                Ok(values)
+            },
+        ).map_err(|e| format!("执行查询失败: {}", e))?;
+        
+        for row_result in rows {
+            let values = row_result.map_err(|e| format!("读取行数据失败: {}", e))?;
+            let mut record: Vec<String> = Vec::with_capacity(column_count);
+            
+            for (i, val) in values.iter().enumerate() {
+                let field = if time_col_indices.contains(&i) {
+                    format_ms_timestamp_csv_field(val, beijing_tz)
+                } else {
+                    sqlite_value_to_csv_field(val)
+                };
+                record.push(field);
+            }
+            
+            wtr.write_record(&record)
+                .map_err(|e| format!("写入CSV行失败: {}", e))?;
+            row_count += 1;
+        }
+        
+        wtr.flush().map_err(|e| format!("刷新CSV文件失败: {}", e))?;
+        Ok(row_count)
+    })
+    .await
+    .map_err(|e| format!("执行数据库查询线程失败: {}", e))??;
+    
+    let file_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    
+    add_query_log(app_handle_ref, &format!("导出完成 | {} 条记录 | 文件大小: {:.2}MB", 
+        result, file_size as f64 / 1024.0 / 1024.0));
+    
+    Ok(result)
+}
+
+/// 将毫秒时间戳 SQLite 值格式化为 CSV 时间字段（东八区，带毫秒）
+fn format_ms_timestamp_csv_field(
+    val: &rusqlite::types::Value,
+    tz: FixedOffset,
+) -> String {
+    let ms: i64 = match val {
+        rusqlite::types::Value::Integer(n) => *n,
+        rusqlite::types::Value::Real(f) => *f as i64,
+        rusqlite::types::Value::Null => return String::new(),
+        other => return format!("'{}", sqlite_value_to_csv_field(other)),
+    };
+    let secs = ms / 1000;
+    let millis = (ms % 1000) as u32;
+    match Utc.timestamp_opt(secs, millis * 1_000_000) {
+        chrono::LocalResult::Single(dt) => {
+            let dt_bj = dt.with_timezone(&tz);
+            format!("'{}.{:03}", dt_bj.format("%Y-%m-%d %H:%M:%S"), millis)
+        }
+        _ => format!("'{}", ms),
+    }
+}
+
 // ============================================================
 // SQL查询（前端显示用）
 // ============================================================
@@ -903,7 +1177,7 @@ fn sqlite_value_to_csv_field(val: &rusqlite::types::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_range_snapshot_command, normalize_sync_range, quote_python_single, quote_shell_single, resolve_local_db_path, validate_database_schema};
+    use super::{build_agg_range_snapshot_command, build_range_snapshot_command, normalize_sync_range, quote_python_single, quote_shell_single, resolve_local_db_path, validate_database_schema, AGGREGATE_TABLE};
 
     #[test]
     fn should_prefer_target_path_when_provided() {
@@ -927,6 +1201,23 @@ mod tests {
     fn should_pass_when_has_supported_tables() {
         assert!(validate_database_schema(vec!["data_wide".to_string()]).is_ok());
         assert!(validate_database_schema(vec!["demand_results".to_string()]).is_ok());
+        assert!(validate_database_schema(vec![AGGREGATE_TABLE.to_string()]).is_ok());
+    }
+
+    #[test]
+    fn should_build_agg_range_snapshot_command() {
+        let cmd = build_agg_range_snapshot_command(
+            "/mnt/data/device_data.db.agg.db",
+            "/tmp/out.db",
+            1000,
+            2000,
+        );
+        assert!(cmd.contains("python3 -c \""));
+        assert!(cmd.contains("src_path='/mnt/data/device_data.db.agg.db'"));
+        assert!(cmd.contains("dst_path='/tmp/out.db'"));
+        assert!(cmd.contains(&format!("FROM srcdb.{}", AGGREGATE_TABLE)));
+        assert!(cmd.contains("WHERE bucket_start_ms >= ? AND bucket_start_ms <= ?"));
+        assert!(cmd.contains("(1000, 2000)"));
     }
 
     #[test]
