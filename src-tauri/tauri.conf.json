@@ -41,15 +41,15 @@
     "windows": {
       "webviewInstallMode": {
         "type": "skip"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
       }
-    },
-    "nsis": {
-      "installMode": "currentUser",
-      "displayLanguageSelector": false,
-      "languages": [
-        "SimpChinese",
-        "English"
-      ]
     }
   },
   "plugins": {
