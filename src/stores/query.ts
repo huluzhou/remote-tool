@@ -18,6 +18,7 @@ export interface SyncDatabaseParams {
 }
 
 export type SourceMode = "remote_sync" | "local_import";
+export type DbKind = "main" | "aggregate";
 
 interface QuerySourceConfig {
   sourceMode: SourceMode;
@@ -28,6 +29,13 @@ interface QuerySourceConfig {
 }
 
 export interface ExportWideTableParams {
+  dbPath: string;
+  startTime: number;
+  endTime: number;
+  outputPath: string;
+}
+
+export interface ExportAggregateParams {
   dbPath: string;
   startTime: number;
   endTime: number;
@@ -88,6 +96,12 @@ export const useQueryStore = defineStore("query", {
     exportedPath: null as string | null,
     dbSynced: false,
     dbSyncTime: null as string | null,
+    aggDbSynced: false,
+    aggDbSyncTime: null as string | null,
+    // 当前活动数据库类型：main（宽表/需量）或 aggregate（聚合库）
+    activeDbKind: "main" as DbKind,
+    // 聚合库同步落盘路径（仅当前会话内有效）
+    aggSyncTargetPath: "",
     syncing: false,
     syncProgress: 0,
     syncProgressMessage: "",
@@ -107,6 +121,7 @@ export const useQueryStore = defineStore("query", {
       this.remoteDbPath = config.remoteDbPath;
       // 强制清空持久化路径，避免重启后误覆盖历史文件
       this.syncTargetPath = "";
+      this.aggSyncTargetPath = "";
       this.importedDbPath = config.importedDbPath;
       this.activeDbPath = config.activeDbPath;
       this.lastReadyAt = config.lastReadyAt;
@@ -136,6 +151,10 @@ export const useQueryStore = defineStore("query", {
     setSyncTargetPath(path: string) {
       this.syncTargetPath = path;
       this.saveSourceConfig();
+    },
+
+    setAggSyncTargetPath(path: string) {
+      this.aggSyncTargetPath = path;
     },
 
     setImportedDbPath(path: string) {
@@ -184,6 +203,38 @@ export const useQueryStore = defineStore("query", {
         // 错误信息通过后端日志事件已经发送，这里只更新UI状态
       } finally {
         // 取消事件监听
+        unlisten();
+        this.loading = false;
+      }
+    },
+
+    async exportAggregate(params: ExportAggregateParams): Promise<void> {
+      this.loading = true;
+      this.error = null;
+      this.progress = 0;
+      this.progressMessage = "准备导出...";
+      this.logs = [];
+      this.exportedRows = 0;
+      this.exportedPath = null;
+
+      const unlisten = await listen<string>("query-log", (event) => {
+        this.logs.push(event.payload);
+      });
+
+      try {
+        this.updateProgress(10, "开始导出...");
+
+        const rowCount = await invoke<number>("export_aggregate_direct", { params });
+
+        this.exportedRows = rowCount;
+        this.exportedPath = params.outputPath;
+        this.progress = 100;
+        this.progressMessage = `导出完成 (${rowCount} 条记录)`;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.error = errorMsg;
+        this.progressMessage = "导出失败";
+      } finally {
         unlisten();
         this.loading = false;
       }
@@ -296,6 +347,7 @@ export const useQueryStore = defineStore("query", {
         this.dbSyncTime = new Date().toLocaleTimeString("zh-CN", {
           hour12: false,
         });
+        this.activeDbKind = "main";
         this.setActiveDbPath(syncedPath);
         this.syncProgress = 100;
         this.syncProgressMessage = "同步完成";
@@ -310,11 +362,62 @@ export const useQueryStore = defineStore("query", {
       }
     },
 
+
+    async syncAggregateDatabase(params: SyncDatabaseParams): Promise<void> {
+      this.syncing = true;
+      this.error = null;
+      this.logs = [];
+      this.syncProgress = 0;
+      this.syncProgressMessage = "准备同步聚合库...";
+
+      const unlistenLog = await listen<string>("query-log", (event) => {
+        this.logs.push(event.payload);
+      });
+
+      const unlistenProgress = await listen<{
+        downloaded: number;
+        total: number;
+        percent: number;
+      }>("db-sync-progress", (event) => {
+        const { downloaded, total, percent } = event.payload;
+        this.syncProgress = percent;
+        const mb = (n: number) => (n / 1024 / 1024).toFixed(2);
+        this.syncProgressMessage = `${mb(downloaded)}MB / ${mb(total)}MB (${percent}%)`;
+      });
+
+      try {
+        const syncedPath = await invoke<string>("sync_aggregate_database", {
+          dbPath: params.dbPath,
+          targetPath: params.targetPath || this.aggSyncTargetPath || null,
+          startTime: params.startTime ?? null,
+          endTime: params.endTime ?? null,
+        });
+        this.aggDbSynced = true;
+        this.aggDbSyncTime = new Date().toLocaleTimeString("zh-CN", {
+          hour12: false,
+        });
+        this.activeDbKind = "aggregate";
+        this.setActiveDbPath(syncedPath);
+        this.syncProgress = 100;
+        this.syncProgressMessage = "聚合库同步完成";
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        this.error = errorMsg;
+        this.syncProgressMessage = "聚合库同步失败";
+      } finally {
+        unlistenLog();
+        unlistenProgress();
+        this.syncing = false;
+      }
+    },
     async clearDbCache(): Promise<void> {
       try {
         await invoke("clear_db_cache");
         this.dbSynced = false;
         this.dbSyncTime = null;
+        this.aggDbSynced = false;
+        this.aggDbSyncTime = null;
+        this.activeDbKind = "main";
         if (this.sourceMode === "remote_sync") {
           this.activeDbPath = "";
           this.saveSourceConfig();

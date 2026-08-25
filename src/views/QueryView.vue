@@ -91,9 +91,12 @@ const handleQuery = async (params: any) => {
   // 先弹出文件保存对话框
   let filePath: string | null = null;
   const queryType = params.queryType || "wide_table";
-  const defaultFileName = queryType === "demand" 
-    ? `demand_results_${Date.now()}.csv`
-    : `wide_table_${Date.now()}.csv`;
+  const defaultFileName =
+    queryType === "demand"
+      ? `demand_results_${Date.now()}.csv`
+      : queryType === "aggregate"
+      ? `aggregate_wide_15m_${Date.now()}.csv`
+      : `wide_table_${Date.now()}.csv`;
   
   try {
     filePath = await save({
@@ -116,7 +119,14 @@ const handleQuery = async (params: any) => {
   }
 
   // 根据查询类型调用不同的导出函数
-  if (queryType === "demand") {
+  if (queryType === "aggregate") {
+    await queryStore.exportAggregate({
+      dbPath: params.dbPath,
+      startTime: params.startTime,
+      endTime: params.endTime,
+      outputPath: filePath,
+    });
+  } else if (queryType === "demand") {
     await queryStore.exportDemandResults({
       dbPath: params.dbPath,
       startTime: params.startTime,
