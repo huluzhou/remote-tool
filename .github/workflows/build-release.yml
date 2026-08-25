@@ -134,16 +134,22 @@ jobs:
           cargo install git-cliff
           git cliff --config cliff.toml --latest --strip all -o release-changelog.md
           {
-            echo "## 使用方式（便携版）"
+            echo "## 使用方式（安装包）"
             echo ""
             echo "**下载地址:** https://github.com/${{ github.repository }}/releases/latest"
+            echo ""
+            echo "1. 下载 \`remote-tool_*_x64-setup.exe\` 安装包"
+            echo "2. 双击运行，按向导安装（默认当前用户安装，无需管理员权限）"
+            echo "3. 从开始菜单或桌面快捷方式启动 \`Remote Tool\`"
+            echo ""
+            echo "## 使用方式（便携版）"
             echo ""
             echo "1. 下载 \`remote-tool-portable-*.zip\` 压缩包"
             echo "2. 解压到任意目录"
             echo "3. 直接运行 \`remote-tool.exe\` 即可（无需安装）"
             echo ""
             echo "**功能:**"
-            echo "- 数据查询：通过SSH连接远程服务器查询SQLite数据库"
+            echo "- 数据查询：通过SSH连接远程服务器查询SQLite数据库（宽表 / 需量 / 聚合库）"
             echo "- 应用部署：通过SSH部署应用程序到远程服务器"
             echo ""
             echo "---"
@@ -206,7 +212,9 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: 'Remote Tool ${{ steps.tag.outputs.tag }}'
           body_path: release-notes.md
-          files: remote-tool-portable-*.zip
+          files: |
+            remote-tool-portable-*.zip
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe
           draft: false
           prerelease: false
         env:

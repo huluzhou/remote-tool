@@ -27,7 +27,10 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": false,
     "icon": [
       "icons/icon.ico",
@@ -39,6 +42,14 @@
       "webviewInstallMode": {
         "type": "skip"
       }
+    },
+    "nsis": {
+      "installMode": "currentUser",
+      "displayLanguageSelector": false,
+      "languages": [
+        "SimpChinese",
+        "English"
+      ]
     }
   },
   "plugins": {
