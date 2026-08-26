@@ -71,6 +71,56 @@ fn quote_python_single(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+
+/// 检测远程命令输出中的 SSH/网络连接错误特征（JumpServer 网关可能把连接失败
+/// 包装为 stdout 文本且返回假成功 exit 0，不能仅凭退出码判断）。
+/// 命中则返回错误描述，否则返回 None。
+fn detect_remote_conn_error(stdout: &str, stderr: &str) -> Option<String> {
+    let haystack = format!("{} {}", stdout, stderr);
+    let lower = haystack.to_lowercase();
+
+    // Go 网络错误（JumpServer 常用 Go 实现）
+    if lower.contains("dial tcp") || lower.contains("dial udp") {
+        return Some("远程连接失败（dial tcp/udp 错误，通常是目标主机不可达或网关网络异常）".to_string());
+    }
+    if lower.contains("i/o timeout") || lower.contains("io timeout") {
+        return Some("远程连接超时（i/o timeout）".to_string());
+    }
+    if lower.contains("connection refused") {
+        return Some("远程连接被拒绝（connection refused，目标端口未监听或被防火墙拦截）".to_string());
+    }
+    if lower.contains("connection timed out") || lower.contains("connection timeout") {
+        return Some("远程连接超时（connection timed out）".to_string());
+    }
+    if lower.contains("no route to host") {
+        return Some("远程主机不可达（no route to host）".to_string());
+    }
+    if lower.contains("network is unreachable") {
+        return Some("网络不可达（network is unreachable）".to_string());
+    }
+    if lower.contains("ssh_exchange_identification") || lower.contains("ssh: connect to host") {
+        return Some("SSH 握手/连接失败（ssh_exchange_identification）".to_string());
+    }
+    if lower.contains("connection reset by peer") || lower.contains("broken pipe") {
+        return Some("远程连接被重置（connection reset by peer）".to_string());
+    }
+    if lower.contains("handshake failed") {
+        return Some("SSH 握手失败（handshake failed）".to_string());
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return Some("远程命令执行超时（timeout）".to_string());
+    }
+    // 中文字符串（部分网关输出中文）
+    if haystack.contains("连接超时") || haystack.contains("连接失败") || haystack.contains("无法连接") {
+        return Some("远程连接失败（网关返回连接错误）".to_string());
+    }
+    None
+}
+
+/// 判断远程命令输出是否疑似“网络/会话错误”，而非业务执行结果
+fn is_remote_conn_error_stdout(stdout: &str, stderr: &str) -> bool {
+    detect_remote_conn_error(stdout, stderr).is_some()
+}
 /// 聚合结果表名（15 分钟粒度，来自 analysis-collector 的 forecast_aggregation）
 pub const AGGREGATE_TABLE: &str = "forecast_aggregate_wide_15m";
 /// 聚合库远程路径后缀：{device_data.db}.agg.db
@@ -151,9 +201,16 @@ pub async fn sync_aggregate_database(
 
     // 聚合库存在性预检查（旧版本采集器未启用聚合时不会有该文件）
     let check_cmd = format!("ls -l \"{}\" 2>&1", agg_remote_path);
-    let (check_exit, check_out, _) = SshClient::execute_command(&check_cmd)
+    let (check_exit, check_out, check_err) = SshClient::execute_command(&check_cmd)
         .await
         .map_err(|e| format!("检查远程聚合库失败: {}", e))?;
+    if is_remote_conn_error_stdout(&check_out, &check_err) {
+        return Err(format!("检查远程聚合库时网络错误：{}\nstdout=`{}` stderr=`{}`",
+            detect_remote_conn_error(&check_out, &check_err).unwrap_or_default(),
+            check_out.trim(),
+            check_err.trim()
+        ));
+    }
     if check_exit != 0 || check_out.contains("No such file") {
         return Err(format!(
             "远程聚合库不存在: {}（需要采集器启用 forecast_wide_aggregation 后才会生成）",
@@ -225,10 +282,19 @@ async fn sync_database_internal(
         let (range_exit, range_stdout, range_stderr) = SshClient::execute_command(&py_range_cmd)
             .await
             .map_err(|e| format!("执行按时间范围同步失败: {}", e))?;
+        // JumpServer 网关可能把连接失败包装成 stdout 文本并返回假成功（exit 0）
+        if let Some(conn_err) = detect_remote_conn_error(&range_stdout, &range_stderr) {
+            return Err(format!(
+                "按时间范围生成子库时网络失败：{}\nstdout=`{}` stderr=`{}`",
+                conn_err,
+                range_stdout.trim(),
+                range_stderr.trim()
+            ));
+        }
         if range_exit != 0 {
             return Err(format!(
                 "按时间范围生成子库失败（需要远程 python3 + sqlite3）: {}",
-                range_stderr.trim()
+                if range_stderr.trim().is_empty() { range_stdout.trim() } else { range_stderr.trim() }
             ));
         }
         if !range_stdout.trim().contains("ok") {
@@ -1177,7 +1243,7 @@ fn sqlite_value_to_csv_field(val: &rusqlite::types::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agg_range_snapshot_command, build_range_snapshot_command, normalize_sync_range, quote_python_single, quote_shell_single, resolve_local_db_path, validate_database_schema, AGGREGATE_TABLE};
+    use super::{build_agg_range_snapshot_command, build_range_snapshot_command, detect_remote_conn_error, is_remote_conn_error_stdout, normalize_sync_range, quote_python_single, quote_shell_single, resolve_local_db_path, validate_database_schema, AGGREGATE_TABLE};
 
     #[test]
     fn should_prefer_target_path_when_provided() {
@@ -1269,5 +1335,37 @@ mod tests {
         assert!(cmd.contains("(1000, 2000)"));
         assert!(cmd.contains("(10, 20)"));
     }
-}
+    #[test]
+    fn should_detect_jumpserver_dial_tcp_timeout_in_stdout() {
+        let err = detect_remote_conn_error("dial tcp 10.8.0.17:22: i/o timeout", "");
+        assert!(err.is_some(), "should detect dial tcp i/o timeout");
+        let msg = err.unwrap();
+        assert!(msg.contains("远程连接"), "should mention connection issue: {}", msg);
+    }
 
+    #[test]
+    fn should_detect_conn_error_helpers_consistent() {
+        assert!(is_remote_conn_error_stdout("dial tcp 10.8.0.17:22: i/o timeout", ""));
+        assert!(is_remote_conn_error_stdout("", "ssh: connect to host 10.8.0.17 port 22: Connection refused"));
+        assert!(!is_remote_conn_error_stdout("ok", ""));
+        assert!(!is_remote_conn_error_stdout("missing_tables:foo", ""));
+    }
+
+    #[test]
+    fn should_not_misdetect_normal_python_output_as_conn_error() {
+        assert!(!is_remote_conn_error_stdout("ok", ""));
+        assert!(!is_remote_conn_error_stdout("missing_tables:data_wide,demand_results", ""));
+        let err = detect_remote_conn_error("Traceback (most recent call last):", "");
+        assert!(err.is_none(), "python error should not be conn error: {:?}", err);
+    }
+
+    #[test]
+    fn should_detect_other_conn_error_variants() {
+        assert!(detect_remote_conn_error("", "connection refused").is_some());
+        assert!(detect_remote_conn_error("no route to host", "").is_some());
+        assert!(detect_remote_conn_error("connection timed out", "").is_some());
+        assert!(detect_remote_conn_error("", "permission denied").is_none());
+        assert!(detect_remote_conn_error("file not found", "").is_none());
+    }
+
+}
