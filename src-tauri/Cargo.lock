@@ -3794,7 +3794,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "remote-tool"
-version = "2.6.1"
+version = "2.7.2"
 dependencies = [
  "anyhow",
  "async-ssh2-tokio",
