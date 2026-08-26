@@ -137,7 +137,7 @@ fn build_agg_range_snapshot_command(
     let db_path_py = quote_python_single(db_path);
     let remote_tmp_py = quote_python_single(remote_tmp);
     format!(
-        "python3 -c \"import os,sqlite3,sys; src_path='{db_path}'; dst_path='{remote_tmp}'; os.path.exists(dst_path) and os.remove(dst_path); dst=sqlite3.connect(dst_path); dst.execute('ATTACH DATABASE ? AS srcdb', (src_path,)); cur=dst.cursor(); tables={{row[0] for row in cur.execute('SELECT name FROM srcdb.sqlite_master WHERE type=\'table\'')}}; has_agg=('{agg_table}' in tables); has_agg and dst.execute('CREATE TABLE {agg_table} AS SELECT * FROM srcdb.{agg_table} WHERE bucket_start_ms >= ? AND bucket_start_ms <= ?', ({range_start_ms}, {range_end_ms})); dst.commit(); dst.execute('DETACH DATABASE srcdb'); dst.close(); print('ok' if has_agg else ('missing_tables:' + ','.join(sorted(tables))))\"",
+        "python3 -c \"import os,sqlite3,sys; src_path='{db_path}'; dst_path='{remote_tmp}'; os.path.exists(dst_path) and os.remove(dst_path); dst=sqlite3.connect(dst_path); dst.execute('ATTACH DATABASE ? AS srcdb', (src_path,)); cur=dst.cursor(); tables={{row[0] for row in cur.execute('SELECT name FROM srcdb.sqlite_master WHERE type=' + chr(39) + 'table' + chr(39))}}; has_agg=('{agg_table}' in tables); has_agg and dst.execute('CREATE TABLE {agg_table} AS SELECT * FROM srcdb.{agg_table} WHERE bucket_start_ms >= ? AND bucket_start_ms <= ?', ({range_start_ms}, {range_end_ms})); dst.commit(); dst.execute('DETACH DATABASE srcdb'); dst.close(); print('ok' if has_agg else ('missing_tables:' + ','.join(sorted(tables))))\"",
         db_path = db_path_py,
         remote_tmp = remote_tmp_py,
         agg_table = AGGREGATE_TABLE,
@@ -160,7 +160,7 @@ fn build_range_snapshot_command(
     format!(
         "python3 -c \"import os,sqlite3,sys; src_path='{db_path}'; dst_path='{remote_tmp}'; os.path.exists(dst_path) and os.remove(dst_path); \
 dst=sqlite3.connect(dst_path); dst.execute('ATTACH DATABASE ? AS srcdb', (src_path,)); \
-cur=dst.cursor(); tables={{row[0] for row in cur.execute('SELECT name FROM srcdb.sqlite_master WHERE type=\\'table\\'')}}; \
+cur=dst.cursor(); tables={{row[0] for row in cur.execute('SELECT name FROM srcdb.sqlite_master WHERE type=' + chr(39) + 'table' + chr(39))}}; \
 has_wide=('data_wide' in tables); has_demand=('demand_results' in tables); \
 has_wide and dst.execute('CREATE TABLE data_wide AS SELECT * FROM srcdb.data_wide WHERE local_timestamp >= ? AND local_timestamp <= ?', ({range_start_ms}, {range_end_ms})); \
 has_demand and dst.execute('CREATE TABLE demand_results AS SELECT * FROM srcdb.demand_results WHERE timestamp >= ? AND timestamp <= ?', ({range_start_s}, {range_end_s})); \
@@ -1284,6 +1284,9 @@ mod tests {
         assert!(cmd.contains(&format!("FROM srcdb.{}", AGGREGATE_TABLE)));
         assert!(cmd.contains("WHERE bucket_start_ms >= ? AND bucket_start_ms <= ?"));
         assert!(cmd.contains("(1000, 2000)"));
+        // 必须使用 chr(39) 拼接单引号，避免 \' 转义被 SSH 网关吞掉导致 SyntaxError
+        assert!(cmd.contains("WHERE type=' + chr(39) + 'table' + chr(39)"));
+        assert!(!cmd.contains("WHERE type=\'table\'"), "禁止使用反斜杠转义单引号");
     }
 
     #[test]
@@ -1334,6 +1337,9 @@ mod tests {
         assert!(cmd.contains("FROM srcdb.demand_results"));
         assert!(cmd.contains("(1000, 2000)"));
         assert!(cmd.contains("(10, 20)"));
+        // 必须使用 chr(39) 拼接单引号，避免 \' 转义被 SSH 网关吞掉导致 SyntaxError
+        assert!(cmd.contains("WHERE type=' + chr(39) + 'table' + chr(39)"));
+        assert!(!cmd.contains("WHERE type=\'table\'"), "禁止使用反斜杠转义单引号");
     }
     #[test]
     fn should_detect_jumpserver_dial_tcp_timeout_in_stdout() {
